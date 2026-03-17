@@ -109,6 +109,11 @@ class LiveTrader:
         - Uses PRIVATE_KEY exported from Polymarket (reveal.polymarket.com)
         - FUNDER_ADDRESS = your Polymarket proxy wallet (from profile URL)
         - SIGNATURE_TYPE: 0=EOA, 1=POLY_PROXY (email login), 2=GNOSIS_SAFE (browser wallet)
+
+        Builder API (optional but recommended):
+        - Gasless transactions (no POL needed for gas)
+        - Order attribution → volume tracking → weekly USDC rewards
+        - Get keys at: polymarket.com/settings?tab=builder
         """
         if not config.PRIVATE_KEY:
             raise ValueError("PRIVATE_KEY not set in .env file")
@@ -128,18 +133,50 @@ class LiveTrader:
                 init_kwargs["funder"] = config.FUNDER_ADDRESS
                 init_kwargs["signature_type"] = config.SIGNATURE_TYPE
 
-            # Create temp client to derive API creds
+            # Add Builder API config if available (gasless + order attribution)
+            builder_config = self._create_builder_config()
+            if builder_config:
+                init_kwargs["builder_config"] = builder_config
+                print("  Builder API: ENABLED (gasless + attribution)")
+            else:
+                print("  Builder API: disabled (set POLY_BUILDER_API_KEY for gasless trading)")
+
+            # Create client and derive API creds
             temp_client = ClobClient(**init_kwargs)
             temp_client.set_api_creds(temp_client.create_or_derive_api_creds())
 
             self.clob_client = temp_client
             print("  CLOB client initialized successfully")
             print(f"  Funder: {config.FUNDER_ADDRESS[:10]}..." if config.FUNDER_ADDRESS else "  Funder: (EOA mode)")
+            print(f"  Order strategy: {config.ORDER_STRATEGY}")
 
         except Exception as e:
             print(f"  ERROR: Failed to initialize CLOB client: {e}")
             print("  Falling back to paper trading mode")
             self.paper_mode = True
+
+    def _create_builder_config(self):
+        """Create Builder API config if credentials are available."""
+        if not config.BUILDER_API_KEY:
+            return None
+
+        try:
+            from py_builder_signing_sdk.config import BuilderConfig
+            from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
+
+            return BuilderConfig(
+                local_builder_creds=BuilderApiKeyCreds(
+                    key=config.BUILDER_API_KEY,
+                    secret=config.BUILDER_SECRET,
+                    passphrase=config.BUILDER_PASSPHRASE,
+                )
+            )
+        except ImportError:
+            print("  WARNING: py-builder-signing-sdk not installed, skipping Builder API")
+            return None
+        except Exception as e:
+            print(f"  WARNING: Builder API config failed: {e}")
+            return None
 
     # ═══════════════════════════════════════════════════════════════
     # SCAN CYCLE
@@ -382,12 +419,15 @@ class LiveTrader:
     def _live_execute(self, signal: TradingSignal):
         """Execute a live trade on Polymarket CLOB.
 
+        Supports three order strategies:
+        - 'taker':    FOK/FAK market orders for instant fill
+        - 'maker':    Post-only limit orders (earns liquidity rewards)
+        - 'adaptive': Maker for small edges, taker for large edges (>15%)
+
         Key details for neg-risk weather markets:
         - Must pass PartialCreateOrderOptions(neg_risk=True, tick_size=...)
         - BUY_YES: buy the YES token at market price
         - BUY_NO: buy the NO token at (1 - market_price)
-        - tick_size comes from market.minimum_tick_size (typically 0.001)
-        - min order size is market.order_min_size shares (typically 5)
         """
         if not self.clob_client:
             print("  ERROR: CLOB client not initialized")
@@ -401,7 +441,7 @@ class LiveTrader:
             if signal.direction == "BUY_YES":
                 token_id = signal.outcome.token_id  # YES token
                 side = BUY
-                price = signal.market_price
+                base_price = signal.market_price
             else:
                 # BUY_NO: buy the NO token directly
                 token_id = signal.outcome.no_token_id  # NO token
@@ -409,19 +449,33 @@ class LiveTrader:
                     print(f"  ERROR: No NO token ID for '{signal.outcome.name}'")
                     return
                 side = BUY
-                price = 1.0 - signal.market_price  # NO price = 1 - YES price
+                base_price = 1.0 - signal.market_price  # NO price = 1 - YES price
 
             # Determine tick_size from market data
             tick_size = signal.market.minimum_tick_size or "0.001"
-
-            # Round price to tick_size precision
             tick = float(tick_size)
-            price = round(round(price / tick) * tick, 4)
 
-            # Ensure price is within valid bounds
+            # Choose order strategy
+            strategy = config.ORDER_STRATEGY
+            if strategy == "adaptive":
+                strategy = "taker" if signal.edge > config.TAKER_EDGE_THRESHOLD else "maker"
+
+            # Adjust price based on strategy
+            if strategy == "maker":
+                # Post-only: place slightly inside the spread to be first in queue
+                # but DON'T cross the spread (or the order gets rejected)
+                price = base_price - config.MAKER_PRICE_OFFSET
+                order_type_label = "MAKER (post-only)"
+            else:
+                # Taker: match the current best price for instant fill
+                price = base_price
+                order_type_label = "TAKER (market)"
+
+            # Round price to tick_size
+            price = round(round(price / tick) * tick, 4)
             price = max(tick, min(price, 1.0 - tick))
 
-            # Calculate number of shares (size = dollar_amount / price)
+            # Calculate number of shares
             size = signal.suggested_size_usd / price
 
             # Enforce minimum order size
@@ -430,7 +484,6 @@ class LiveTrader:
                 print(f"  Skipping: order size {size:.1f} shares < minimum {min_size}")
                 return
 
-            # Round size to 2 decimal places
             size = round(size, 2)
 
             order_args = OrderArgs(
@@ -446,13 +499,20 @@ class LiveTrader:
                 tick_size=tick_size,
             )
 
-            print(f"  [LIVE] Submitting: {signal.direction} '{signal.outcome.name}' "
+            print(f"  [LIVE] {order_type_label}: {signal.direction} '{signal.outcome.name}' "
                   f"@ {price:.4f} x {size:.2f} shares (${signal.suggested_size_usd:.2f})")
-            print(f"         neg_risk={options.neg_risk}, tick_size={tick_size}")
+            print(f"         edge={signal.edge:.1%}, neg_risk={options.neg_risk}, tick={tick_size}")
 
-            # Two-step: create_order then post_order for better error handling
+            # Execute based on strategy
             signed_order = self.clob_client.create_order(order_args, options)
-            resp = self.clob_client.post_order(signed_order, OrderType.GTC)
+
+            if strategy == "maker":
+                # Post-only: rejected if it would cross the spread (good - prevents bad fills)
+                resp = self.clob_client.post_order(signed_order, OrderType.GTC, post_only=True)
+            else:
+                # Taker: GTC limit at market price (effectively a market order)
+                resp = self.clob_client.post_order(signed_order, OrderType.GTC)
+
             print(f"  [LIVE] Response: {resp}")
 
             if resp.get("success"):
@@ -473,10 +533,34 @@ class LiveTrader:
                 )
                 self.positions.append(position)
                 self._save_state()
-                print(f"  [LIVE] Position opened successfully")
+                print(f"  [LIVE] Position opened ({order_type_label})")
             else:
                 error_msg = resp.get("errorMsg", "Unknown error")
                 print(f"  [LIVE] Order rejected: {error_msg}")
+
+                # If maker order rejected, fall back to taker
+                if strategy == "maker" and "post only" in str(error_msg).lower():
+                    print(f"  [LIVE] Maker rejected (would cross spread), retrying as taker...")
+                    resp = self.clob_client.post_order(signed_order, OrderType.GTC)
+                    if resp.get("success"):
+                        position = Position(
+                            market_slug=signal.market.slug,
+                            outcome_name=signal.outcome.name,
+                            token_id=token_id,
+                            direction=signal.direction,
+                            entry_price=price,
+                            shares=size,
+                            size_usd=signal.suggested_size_usd,
+                            edge_at_entry=signal.edge,
+                            confidence=signal.confidence,
+                            entry_time=datetime.now().isoformat(),
+                            resolution_time=signal.market.end_date,
+                            station_id=signal.market.station_id,
+                            current_edge=signal.edge,
+                        )
+                        self.positions.append(position)
+                        self._save_state()
+                        print(f"  [LIVE] Position opened (fallback taker)")
 
         except Exception as e:
             import traceback

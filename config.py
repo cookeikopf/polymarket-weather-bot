@@ -25,6 +25,22 @@ FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", "")
 # Signature type: 0=EOA, 1=POLY_PROXY (Magic/email login), 2=GNOSIS_SAFE (browser wallet)
 SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))
 
+# ─── Builder API (gasless trading + order attribution + rewards) ───
+# Get your keys at: polymarket.com/settings?tab=builder
+BUILDER_API_KEY = os.getenv("POLY_BUILDER_API_KEY", "")
+BUILDER_SECRET = os.getenv("POLY_BUILDER_SECRET", "")
+BUILDER_PASSPHRASE = os.getenv("POLY_BUILDER_PASSPHRASE", "")
+
+# Order execution strategy:
+# "taker"    = aggressive (FOK/FAK market orders, instant fill)
+# "maker"    = passive (post-only limit orders, earns liquidity rewards)
+# "adaptive" = uses maker for small edges, taker for large edges
+ORDER_STRATEGY = os.getenv("ORDER_STRATEGY", "adaptive")
+
+# Adaptive thresholds
+TAKER_EDGE_THRESHOLD = 0.15  # Use taker (aggressive) if edge > 15%
+MAKER_PRICE_OFFSET = 0.001   # Place maker orders 0.1 cent inside spread
+
 # ═══════════════════════════════════════════════════════════════════
 # WEATHER DATA SOURCES (Open-Meteo - Free, no API key needed)
 # ═══════════════════════════════════════════════════════════════════
