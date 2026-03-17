@@ -1,0 +1,784 @@
+"""
+Live Trading Module
+====================
+Handles real order execution on Polymarket CLOB.
+Supports both paper trading (simulation) and live trading.
+
+Improvements:
+- Smart entry/exit with take-profit, edge decay, gradual position reduction
+- Orderbook liquidity checks before placing orders
+- Paper trading P&L tracking with disk persistence
+- Position correlation management across climate zones
+"""
+
+import os
+import json
+import time
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+from dataclasses import dataclass, field, asdict
+
+import config
+from weather_engine import WeatherEngine
+from market_scanner import MarketScanner, WeatherMarket
+from edge_detector import EdgeDetector, TradingSignal
+
+
+@dataclass
+class Position:
+    """Active trading position."""
+    market_slug: str
+    outcome_name: str
+    token_id: str
+    direction: str
+    entry_price: float
+    shares: float
+    size_usd: float
+    edge_at_entry: float
+    confidence: float
+    entry_time: str
+    resolution_time: str
+    station_id: str = ""
+    current_edge: float = 0.0
+    peak_unrealized_pnl: float = 0.0
+    status: str = "open"  # open, closed, resolved
+
+
+@dataclass
+class TradeRecord:
+    """Completed trade record for P&L tracking."""
+    market_slug: str
+    outcome_name: str
+    station_id: str
+    direction: str
+    entry_price: float
+    exit_price: float
+    shares: float
+    size_usd: float
+    pnl: float
+    edge_at_entry: float
+    entry_time: str
+    exit_time: str
+    exit_reason: str  # "take_profit", "edge_decay", "time_exit", "resolution", "stop_loss"
+
+
+class LiveTrader:
+    """Live trading execution engine with smart entry/exit and P&L tracking."""
+
+    def __init__(self, paper_mode: bool = True):
+        self.paper_mode = paper_mode
+        self.scanner = MarketScanner()
+        self.engines = {}  # station_id -> WeatherEngine
+        self.edge_detector = EdgeDetector()
+
+        # Portfolio state
+        self.bankroll = config.BACKTEST_INITIAL_BANKROLL
+        self.positions: List[Position] = []
+        self.trade_history: List[TradeRecord] = []
+        self.peak_bankroll = self.bankroll
+
+        # CLOB client (initialized on first live trade)
+        self.clob_client = None
+
+        # Load saved state if available
+        self._load_state()
+
+        print(f"\n{'='*50}")
+        print(f"  Weather Prediction Bot")
+        print(f"  Mode: {'PAPER' if paper_mode else 'LIVE'}")
+        print(f"  Bankroll: ${self.bankroll:.2f}")
+        print(f"  Open Positions: {len(self.positions)}")
+        print(f"  Total Trades: {len(self.trade_history)}")
+        print(f"{'='*50}\n")
+
+    def initialize(self):
+        """Initialize engines and calibrate models."""
+        for station_id in config.STATIONS:
+            print(f"Initializing {station_id} engine...")
+            engine = WeatherEngine(station_id)
+            engine.calibrate()
+            self.engines[station_id] = engine
+
+        if not self.paper_mode:
+            self._init_clob_client()
+
+    def _init_clob_client(self):
+        """Initialize Polymarket CLOB client for live trading."""
+        if not config.PRIVATE_KEY:
+            raise ValueError("PRIVATE_KEY not set in .env file")
+
+        try:
+            from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import ApiCreds
+
+            temp_client = ClobClient(
+                config.POLYMARKET_HOST,
+                key=config.PRIVATE_KEY,
+                chain_id=config.CHAIN_ID,
+            )
+            creds = temp_client.derive_api_key()
+
+            self.clob_client = ClobClient(
+                config.POLYMARKET_HOST,
+                key=config.PRIVATE_KEY,
+                chain_id=config.CHAIN_ID,
+                creds=ApiCreds(
+                    api_key=creds.api_key,
+                    api_secret=creds.api_secret,
+                    api_passphrase=creds.api_passphrase,
+                ),
+            )
+            print("  CLOB client initialized successfully")
+        except Exception as e:
+            print(f"  ERROR: Failed to initialize CLOB client: {e}")
+            print("  Falling back to paper trading mode")
+            self.paper_mode = True
+
+    # ═══════════════════════════════════════════════════════════════
+    # SCAN CYCLE
+    # ═══════════════════════════════════════════════════════════════
+
+    def run_scan_cycle(self) -> List[TradingSignal]:
+        """Run one full scan cycle: discover markets, analyze, generate signals."""
+
+        # 1. Scan for active weather markets
+        print("\n[1/4] Scanning for weather markets...")
+        markets = self.scanner.scan_weather_markets()
+        print(f"  Found {len(markets)} active weather markets")
+
+        if not markets:
+            print("  No weather markets found. Waiting...")
+            return []
+
+        all_signals = []
+
+        for market in markets:
+            # 2. Get our weather prediction
+            engine = self.engines.get(market.station_id)
+            if not engine:
+                continue
+
+            print(f"\n[2/4] Analyzing: {market.question}")
+
+            # Fetch forecasts
+            forecasts = engine.fetch_multi_model_forecasts(market.target_date)
+            if not forecasts:
+                print("  No forecast data available")
+                continue
+
+            ensemble_stats = engine.compute_ensemble_stats(forecasts)
+            print(f"  Ensemble: mean={ensemble_stats['mean']:.1f}°, "
+                  f"spread={ensemble_stats['spread']:.1f}°, "
+                  f"agreement={ensemble_stats['agreement']:.1%}")
+
+            # Generate probability distribution
+            bucket_edges = self._market_to_bucket_edges(market)
+            if not bucket_edges:
+                continue
+
+            our_probs = engine.compute_probability_distribution(forecasts, bucket_edges)
+
+            # 3. Detect edges
+            print(f"[3/4] Detecting edges...")
+            current_exposure = sum(p.size_usd for p in self.positions)
+            signals = self.edge_detector.find_edges(
+                market, our_probs, ensemble_stats, self.bankroll, current_exposure
+            )
+
+            if signals:
+                print(f"  Found {len(signals)} trading signals:")
+                for s in signals[:5]:
+                    print(f"    {s.direction} '{s.outcome.name}' | "
+                          f"Edge: {s.edge:.1%} | "
+                          f"Size: ${s.suggested_size_usd:.2f} | "
+                          f"EV: ${s.expected_value:.4f}/$ | "
+                          f"Conf: {s.confidence:.1%}")
+            else:
+                print("  No actionable edges found")
+
+            all_signals.extend(signals)
+
+        # 4. Execute signals
+        if all_signals:
+            print(f"\n[4/4] Executing top signals...")
+            self._execute_signals(all_signals)
+        else:
+            print(f"\n[4/4] No trades to execute")
+
+        return all_signals
+
+    def _market_to_bucket_edges(self, market: WeatherMarket) -> List[float]:
+        """Convert market outcomes to bucket edges.
+
+        Parses real Polymarket outcome names to extract the exact bucket boundaries.
+        - °F markets: "32-33°F" → edges at 32, 34; "31°F or below" → lower tail at 32
+        - °C markets: "14°C" → edges at 14, 15; "12°C or below" → lower tail at 13
+
+        Returns sorted list of edges where:
+        - Everything < edges[0] = lower tail ("X or below")
+        - edges[i] to edges[i+1] = regular bucket
+        - Everything >= edges[-1] = upper tail ("X or higher")
+        """
+        import re
+
+        station = config.STATIONS.get(market.station_id, {})
+        is_fahrenheit = station.get("unit", "fahrenheit") == "fahrenheit"
+
+        range_lows = []   # lower bounds of regular range buckets
+        tail_low = None    # boundary of "X or below" tail
+        tail_high = None   # boundary of "X or higher" tail
+
+        for outcome in market.outcomes:
+            name = outcome.name
+
+            # Check for tail labels first
+            match_below = re.search(r'(-?\d+)\s*°?\s*[FC]?\s*or\s*below', name, re.IGNORECASE)
+            match_higher = re.search(r'(-?\d+)\s*°?\s*[FC]?\s*or\s*higher', name, re.IGNORECASE)
+
+            if match_below:
+                tail_low = int(match_below.group(1))
+                continue
+            if match_higher:
+                tail_high = int(match_higher.group(1))
+                continue
+
+            # °F range: "32-33°F" -> low bound is 32
+            match = re.search(r'(-?\d+)\s*[-–]\s*(-?\d+)\s*°?\s*F', name)
+            if match:
+                range_lows.append(int(match.group(1)))
+                continue
+
+            # °C single degree: "14°C" or "-5°C" -> that degree is the bucket
+            match = re.search(r'(-?\d+)\s*°\s*C', name)
+            if match:
+                range_lows.append(int(match.group(1)))
+                continue
+
+            # Fallback: extract first integer
+            nums = re.findall(r'-?\d+', name)
+            if nums:
+                range_lows.append(int(nums[0]))
+
+        if not range_lows:
+            return []
+
+        range_lows.sort()
+        step = 2 if is_fahrenheit else 1
+
+        # Build edges: each range_low starts a bucket of width `step`
+        # The edges array defines boundaries between buckets:
+        # [range_lows[0], range_lows[0]+step, range_lows[1]+step, ...]
+        # For °C: [13, 14, 15, 16, ...] (each bucket is 1°C)
+        # For °F: [32, 34, 36, 38, ...] (each bucket is 2°F)
+        edges = []
+        for low in range_lows:
+            edges.append(low)
+        # Add the upper bound of the last range bucket
+        edges.append(range_lows[-1] + step)
+
+        # Deduplicate and sort
+        edges = sorted(set(edges))
+        return edges
+
+    # ═══════════════════════════════════════════════════════════════
+    # EXECUTION
+    # ═══════════════════════════════════════════════════════════════
+
+    def _execute_signals(self, signals: List[TradingSignal]):
+        """Execute trading signals (paper or live) with correlation checks."""
+        # Sort by risk-adjusted EV
+        signals.sort(key=lambda s: s.expected_value * s.confidence, reverse=True)
+
+        executed = 0
+        for signal in signals:
+            if executed >= 3:  # Max trades per cycle
+                break
+
+            if signal.suggested_size_usd < config.MIN_TRADE_SIZE_USDC:
+                continue
+
+            # Check position limits
+            if len(self.positions) >= config.MAX_CONCURRENT_POSITIONS:
+                print("  Max concurrent positions reached")
+                break
+
+            # Check climate zone correlation limits
+            if not self._check_zone_capacity(signal.market.station_id):
+                print(f"  Skipping {signal.market.station_id}: zone position limit reached")
+                continue
+
+            # Check orderbook liquidity (for live markets)
+            if not self.paper_mode and signal.outcome.token_id and not signal.outcome.token_id.startswith("sim_"):
+                depth = self.scanner.fetch_orderbook_depth(signal.outcome.token_id)
+                if not depth["has_liquidity"]:
+                    print(f"  Skipping '{signal.outcome.name}': insufficient liquidity")
+                    continue
+                # Adjust size if liquidity is thin
+                available = depth["ask_depth"] if signal.direction == "BUY_YES" else depth["bid_depth"]
+                if available > 0 and signal.suggested_size_usd > available * 0.5:
+                    signal.suggested_size_usd = min(signal.suggested_size_usd, available * 0.5)
+                    print(f"  Reduced size to ${signal.suggested_size_usd:.2f} due to thin liquidity")
+
+            if self.paper_mode:
+                self._paper_execute(signal)
+            else:
+                self._live_execute(signal)
+
+            executed += 1
+
+    def _check_zone_capacity(self, station_id: str) -> bool:
+        """Check if we can open another position in the same climate zone."""
+        max_per_zone = getattr(config, "MAX_POSITIONS_PER_ZONE", 3)
+        zones = getattr(config, "CLIMATE_ZONES", {})
+
+        # Find which zone this station belongs to
+        station_zone = None
+        for zone_name, stations in zones.items():
+            if station_id in stations:
+                station_zone = zone_name
+                break
+
+        if station_zone is None:
+            return True  # Unknown zone, allow
+
+        # Count open positions in the same zone
+        zone_stations = set(zones.get(station_zone, []))
+        zone_positions = sum(1 for p in self.positions if p.station_id in zone_stations)
+
+        return zone_positions < max_per_zone
+
+    def _paper_execute(self, signal: TradingSignal):
+        """Execute a paper trade."""
+        position = Position(
+            market_slug=signal.market.slug,
+            outcome_name=signal.outcome.name,
+            token_id=signal.outcome.token_id,
+            direction=signal.direction,
+            entry_price=signal.market_price,
+            shares=signal.suggested_size_usd / signal.market_price,
+            size_usd=signal.suggested_size_usd,
+            edge_at_entry=signal.edge,
+            confidence=signal.confidence,
+            entry_time=datetime.now().isoformat(),
+            resolution_time=signal.market.end_date,
+            station_id=signal.market.station_id,
+            current_edge=signal.edge,
+        )
+        self.positions.append(position)
+        self._save_state()
+
+        print(f"  [PAPER] {signal.direction} '{signal.outcome.name}' "
+              f"@ {signal.market_price:.3f} | "
+              f"Size: ${signal.suggested_size_usd:.2f} | "
+              f"Edge: {signal.edge:.1%}")
+
+    def _live_execute(self, signal: TradingSignal):
+        """Execute a live trade on Polymarket CLOB."""
+        if not self.clob_client:
+            print("  ERROR: CLOB client not initialized")
+            return
+
+        try:
+            from py_clob_client.clob_types import OrderArgs, OrderType
+            from py_clob_client.order_builder.constants import BUY, SELL
+
+            # Determine token and side
+            if signal.direction == "BUY_YES":
+                token_id = signal.outcome.token_id
+                side = BUY
+                price = signal.market_price
+            else:
+                token_id = signal.outcome.token_id
+                side = SELL
+                price = signal.market_price
+
+            size = signal.suggested_size_usd / price
+
+            order_args = OrderArgs(
+                price=round(price, 2),
+                size=round(size, 2),
+                side=side,
+                token_id=token_id,
+            )
+
+            resp = self.clob_client.create_and_post_order(order_args)
+            print(f"  [LIVE] Order submitted: {resp}")
+
+            if resp.get("success"):
+                position = Position(
+                    market_slug=signal.market.slug,
+                    outcome_name=signal.outcome.name,
+                    token_id=token_id,
+                    direction=signal.direction,
+                    entry_price=price,
+                    shares=size,
+                    size_usd=signal.suggested_size_usd,
+                    edge_at_entry=signal.edge,
+                    confidence=signal.confidence,
+                    entry_time=datetime.now().isoformat(),
+                    resolution_time=signal.market.end_date,
+                    station_id=signal.market.station_id,
+                    current_edge=signal.edge,
+                )
+                self.positions.append(position)
+                self._save_state()
+
+        except Exception as e:
+            print(f"  ERROR: Live execution failed: {e}")
+
+    # ═══════════════════════════════════════════════════════════════
+    # SMART EXIT STRATEGY
+    # ═══════════════════════════════════════════════════════════════
+
+    def check_positions(self):
+        """Check and manage existing positions with smart exit logic."""
+        for pos in self.positions[:]:
+            try:
+                resolution_time = datetime.fromisoformat(pos.resolution_time.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                # Can't parse resolution time, use a default far future
+                resolution_time = datetime.now() + timedelta(days=7)
+                if resolution_time.tzinfo is None:
+                    from datetime import timezone
+                    resolution_time = resolution_time.replace(tzinfo=timezone.utc)
+
+            now = datetime.now(resolution_time.tzinfo) if resolution_time.tzinfo else datetime.now()
+            hours_to_resolution = (resolution_time - now).total_seconds() / 3600
+
+            # --- Take Profit: if market price matches our probability (edge -> 0) ---
+            if self._check_take_profit(pos):
+                self._exit_position(pos, "take_profit")
+                continue
+
+            # --- Edge Decay: re-evaluate if new forecasts change our edge ---
+            if self._check_edge_decay(pos):
+                self._exit_position(pos, "edge_decay")
+                continue
+
+            # --- Smart Time-Based Exit ---
+            # Gradual position reduction instead of hard 2h cutoff
+            if hours_to_resolution < 6:
+                if hours_to_resolution < 2:
+                    # Hard exit unless deep in profit
+                    unrealized_pnl = self._estimate_unrealized_pnl(pos)
+                    if unrealized_pnl > pos.size_usd * 0.3:
+                        # Deep in profit - let it ride to resolution
+                        print(f"  Letting {pos.outcome_name} ride (profit: ${unrealized_pnl:.2f})")
+                    else:
+                        print(f"  Exiting {pos.outcome_name} - 2h to resolution")
+                        self._exit_position(pos, "time_exit")
+                elif hours_to_resolution < 6:
+                    # Reduce 50% of position at 6h mark
+                    if pos.shares > 0 and not hasattr(pos, '_reduced'):
+                        print(f"  Reducing {pos.outcome_name} by 50% - 6h to resolution")
+                        self._reduce_position(pos, 0.5)
+
+    def _check_take_profit(self, pos: Position) -> bool:
+        """Check if market price has moved to match our probability (edge -> 0)."""
+        take_profit_threshold = getattr(config, "TAKE_PROFIT_EDGE_PCT", 0.02)
+        if abs(pos.current_edge) < take_profit_threshold and pos.current_edge < pos.edge_at_entry * 0.3:
+            return True
+        return False
+
+    def _check_edge_decay(self, pos: Position) -> bool:
+        """Check if our edge has significantly decayed based on new forecast data."""
+        engine = self.engines.get(pos.station_id)
+        if not engine:
+            return False
+
+        try:
+            # Extract target_date from slug
+            target_date = self._slug_to_target_date(pos.market_slug)
+            if not target_date:
+                return False
+
+            forecasts = engine.fetch_multi_model_forecasts(target_date)
+            if not forecasts:
+                return False
+
+            # Recompute our probability for this bucket
+            station = config.STATIONS.get(pos.station_id, {})
+            is_fahrenheit = station.get("unit", "fahrenheit") == "fahrenheit"
+            ensemble_mean = sum(forecasts.values()) / len(forecasts)
+
+            # Simple edge decay check: if forecast moved significantly away from entry assumption
+            # More sophisticated: recompute full probability distribution
+            # For now, flag if edge might have reversed
+            if pos.edge_at_entry > 0.10 and abs(pos.current_edge) < 0.02:
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    def _estimate_unrealized_pnl(self, pos: Position) -> float:
+        """Estimate unrealized P&L for a position."""
+        # In paper mode, approximate based on entry edge
+        # Positive edge at entry suggests the position should be profitable
+        if pos.direction == "BUY_YES":
+            estimated_current_price = pos.entry_price + pos.current_edge * 0.5
+            return pos.shares * (estimated_current_price - pos.entry_price)
+        else:
+            estimated_current_price = pos.entry_price - pos.current_edge * 0.5
+            return pos.shares * (pos.entry_price - estimated_current_price)
+
+    def _reduce_position(self, pos: Position, fraction: float):
+        """Reduce a position by a fraction (e.g., 0.5 = close half)."""
+        exit_shares = pos.shares * fraction
+        exit_size = pos.size_usd * fraction
+
+        # Record partial exit
+        pnl = self._estimate_unrealized_pnl(pos) * fraction
+        self.trade_history.append(TradeRecord(
+            market_slug=pos.market_slug,
+            outcome_name=pos.outcome_name,
+            station_id=pos.station_id,
+            direction=pos.direction,
+            entry_price=pos.entry_price,
+            exit_price=pos.entry_price,  # approximate
+            shares=exit_shares,
+            size_usd=exit_size,
+            pnl=pnl,
+            edge_at_entry=pos.edge_at_entry,
+            entry_time=pos.entry_time,
+            exit_time=datetime.now().isoformat(),
+            exit_reason="partial_time_exit",
+        ))
+
+        # Reduce position
+        pos.shares -= exit_shares
+        pos.size_usd -= exit_size
+        self.bankroll += exit_size + pnl
+
+        self._save_state()
+
+    def _exit_position(self, position: Position, reason: str = "time_exit"):
+        """Exit a position (paper or live) and record trade."""
+        pnl = self._estimate_unrealized_pnl(position)
+
+        record = TradeRecord(
+            market_slug=position.market_slug,
+            outcome_name=position.outcome_name,
+            station_id=position.station_id,
+            direction=position.direction,
+            entry_price=position.entry_price,
+            exit_price=position.entry_price,  # approximate for paper
+            shares=position.shares,
+            size_usd=position.size_usd,
+            pnl=pnl,
+            edge_at_entry=position.edge_at_entry,
+            entry_time=position.entry_time,
+            exit_time=datetime.now().isoformat(),
+            exit_reason=reason,
+        )
+        self.trade_history.append(record)
+        self.bankroll += position.size_usd + pnl
+        self.peak_bankroll = max(self.peak_bankroll, self.bankroll)
+
+        if position in self.positions:
+            self.positions.remove(position)
+
+        self._save_state()
+
+        print(f"  [{'PAPER' if self.paper_mode else 'LIVE'}] Exited {position.outcome_name} "
+              f"(reason: {reason}, P&L: ${pnl:+.2f})")
+
+    def _slug_to_target_date(self, slug: str) -> Optional[str]:
+        """Extract target date from a market slug."""
+        import re
+        months = {
+            "january": 1, "february": 2, "march": 3, "april": 4,
+            "may": 5, "june": 6, "july": 7, "august": 8,
+            "september": 9, "october": 10, "november": 11, "december": 12,
+        }
+        match = re.search(r'on-(\w+)-(\d+)-(\d{4})', slug)
+        if match:
+            month = months.get(match.group(1).lower())
+            if month:
+                return f"{match.group(3)}-{month:02d}-{int(match.group(2)):02d}"
+        return None
+
+    # ═══════════════════════════════════════════════════════════════
+    # P&L TRACKING & PERSISTENCE
+    # ═══════════════════════════════════════════════════════════════
+
+    def _save_state(self):
+        """Save positions and trade history to disk."""
+        os.makedirs(config.RESULTS_DIR, exist_ok=True)
+        state = {
+            "timestamp": datetime.now().isoformat(),
+            "bankroll": self.bankroll,
+            "peak_bankroll": self.peak_bankroll,
+            "positions": [asdict(p) for p in self.positions],
+            "trade_history": [asdict(t) for t in self.trade_history],
+        }
+        try:
+            with open(f"{config.RESULTS_DIR}/paper_trading_state.json", "w") as f:
+                json.dump(state, f, indent=2, default=str)
+        except Exception as e:
+            print(f"  Warning: Failed to save state: {e}")
+
+    def _load_state(self):
+        """Load positions and trade history from disk."""
+        state_path = f"{config.RESULTS_DIR}/paper_trading_state.json"
+        if not os.path.exists(state_path):
+            return
+
+        try:
+            with open(state_path, "r") as f:
+                state = json.load(f)
+
+            self.bankroll = state.get("bankroll", self.bankroll)
+            self.peak_bankroll = state.get("peak_bankroll", self.peak_bankroll)
+
+            self.positions = []
+            for p in state.get("positions", []):
+                self.positions.append(Position(**{
+                    k: v for k, v in p.items()
+                    if k in Position.__dataclass_fields__
+                }))
+
+            self.trade_history = []
+            for t in state.get("trade_history", []):
+                self.trade_history.append(TradeRecord(**{
+                    k: v for k, v in t.items()
+                    if k in TradeRecord.__dataclass_fields__
+                }))
+
+            print(f"  Loaded state: ${self.bankroll:.2f} bankroll, "
+                  f"{len(self.positions)} positions, {len(self.trade_history)} trades")
+        except Exception as e:
+            print(f"  Warning: Failed to load state: {e}")
+
+    def compute_pnl_report(self) -> Dict:
+        """Compute running P&L and generate status report."""
+        total_realized_pnl = sum(t.pnl for t in self.trade_history)
+        total_unrealized_pnl = sum(self._estimate_unrealized_pnl(p) for p in self.positions)
+
+        wins = [t for t in self.trade_history if t.pnl > 0]
+        losses = [t for t in self.trade_history if t.pnl <= 0]
+
+        win_rate = len(wins) / len(self.trade_history) * 100 if self.trade_history else 0
+        avg_win = sum(t.pnl for t in wins) / len(wins) if wins else 0
+        avg_loss = sum(t.pnl for t in losses) / len(losses) if losses else 0
+        profit_factor = abs(sum(t.pnl for t in wins) / sum(t.pnl for t in losses)) if losses and sum(t.pnl for t in losses) != 0 else float("inf")
+
+        current_drawdown = (self.peak_bankroll - self.bankroll) / self.peak_bankroll * 100 if self.peak_bankroll > 0 else 0
+
+        # Per-station breakdown
+        station_pnl = {}
+        for t in self.trade_history:
+            if t.station_id not in station_pnl:
+                station_pnl[t.station_id] = {"pnl": 0, "trades": 0, "wins": 0}
+            station_pnl[t.station_id]["pnl"] += t.pnl
+            station_pnl[t.station_id]["trades"] += 1
+            if t.pnl > 0:
+                station_pnl[t.station_id]["wins"] += 1
+
+        report = {
+            "timestamp": datetime.now().isoformat(),
+            "mode": "PAPER" if self.paper_mode else "LIVE",
+            "bankroll": self.bankroll,
+            "peak_bankroll": self.peak_bankroll,
+            "current_drawdown_pct": current_drawdown,
+            "total_realized_pnl": total_realized_pnl,
+            "total_unrealized_pnl": total_unrealized_pnl,
+            "total_pnl": total_realized_pnl + total_unrealized_pnl,
+            "open_positions": len(self.positions),
+            "total_trades": len(self.trade_history),
+            "win_rate": win_rate,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "profit_factor": profit_factor,
+            "station_breakdown": station_pnl,
+        }
+
+        return report
+
+    def print_pnl_report(self):
+        """Print a formatted P&L report."""
+        report = self.compute_pnl_report()
+
+        print(f"\n{'='*55}")
+        print(f"  P&L Report ({report['mode']} Mode)")
+        print(f"{'='*55}")
+        print(f"  Bankroll:          ${report['bankroll']:.2f}")
+        print(f"  Peak Bankroll:     ${report['peak_bankroll']:.2f}")
+        print(f"  Drawdown:          {report['current_drawdown_pct']:.1f}%")
+        print(f"  Realized P&L:      ${report['total_realized_pnl']:+.2f}")
+        print(f"  Unrealized P&L:    ${report['total_unrealized_pnl']:+.2f}")
+        print(f"  Total P&L:         ${report['total_pnl']:+.2f}")
+        print(f"  Open Positions:    {report['open_positions']}")
+        print(f"  Total Trades:      {report['total_trades']}")
+        print(f"  Win Rate:          {report['win_rate']:.1f}%")
+        print(f"  Avg Win:           ${report['avg_win']:+.2f}")
+        print(f"  Avg Loss:          ${report['avg_loss']:+.2f}")
+        print(f"  Profit Factor:     {report['profit_factor']:.2f}")
+
+        if report['station_breakdown']:
+            print(f"\n  Station Breakdown:")
+            for station, stats in sorted(report['station_breakdown'].items(), key=lambda x: x[1]['pnl'], reverse=True):
+                wr = stats['wins'] / stats['trades'] * 100 if stats['trades'] else 0
+                print(f"    {station:12s}: ${stats['pnl']:+8.2f} ({stats['trades']} trades, {wr:.0f}% win)")
+
+        print(f"{'='*55}\n")
+
+        # Save report to disk
+        os.makedirs(config.RESULTS_DIR, exist_ok=True)
+        with open(f"{config.RESULTS_DIR}/pnl_report.json", "w") as f:
+            json.dump(report, f, indent=2, default=str)
+
+    # ═══════════════════════════════════════════════════════════════
+    # CONTINUOUS OPERATION
+    # ═══════════════════════════════════════════════════════════════
+
+    def run_continuous(self, duration_minutes: int = 60):
+        """Run the bot continuously."""
+        print(f"\nStarting continuous mode for {duration_minutes} minutes...")
+        end_time = datetime.now() + timedelta(minutes=duration_minutes)
+
+        cycle = 0
+        while datetime.now() < end_time:
+            cycle += 1
+            print(f"\n{'─'*40}")
+            print(f"  Cycle {cycle} | {datetime.now().strftime('%H:%M:%S')}")
+            print(f"  Bankroll: ${self.bankroll:.2f} | Positions: {len(self.positions)}")
+            print(f"{'─'*40}")
+
+            # Check drawdown halt
+            if self.peak_bankroll > 0:
+                dd = (self.peak_bankroll - self.bankroll) / self.peak_bankroll
+                if dd > config.MAX_DRAWDOWN_PCT:
+                    print(f"  DRAWDOWN HALT: {dd:.1%} exceeds {config.MAX_DRAWDOWN_PCT:.0%} limit")
+                    break
+
+            try:
+                self.run_scan_cycle()
+                self.check_positions()
+            except Exception as e:
+                print(f"  Error in cycle: {e}")
+
+            # Print report every 5 cycles
+            if cycle % 5 == 0:
+                self.print_pnl_report()
+
+            # Wait for next scan
+            sleep_time = min(config.SCAN_INTERVAL_SECONDS,
+                           (end_time - datetime.now()).total_seconds())
+            if sleep_time > 0:
+                print(f"\n  Sleeping {sleep_time:.0f}s until next scan...")
+                time.sleep(sleep_time)
+
+        # Final report
+        self.print_pnl_report()
+
+    def get_status(self) -> Dict:
+        """Get current bot status."""
+        return {
+            "mode": "PAPER" if self.paper_mode else "LIVE",
+            "bankroll": self.bankroll,
+            "positions": len(self.positions),
+            "total_trades": len(self.trade_history),
+            "peak_bankroll": self.peak_bankroll,
+            "current_drawdown": (self.peak_bankroll - self.bankroll) / self.peak_bankroll * 100 if self.peak_bankroll > 0 else 0,
+        }

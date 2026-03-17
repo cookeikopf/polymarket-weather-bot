@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+venv/
+data/
+*.log
+results/paper_trades.json

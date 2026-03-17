@@ -1,0 +1,195 @@
+{
+  "summary": {
+    "total_cities": 20,
+    "total_trades": 684,
+    "calendar_days": 438,
+    "trades_per_day": 1.6,
+    "trades_per_week": 10.9,
+    "trades_per_month": 46.8,
+    "trading_frequency_pct": 45.7,
+    "total_pnl": 118233.66,
+    "win_rate": 76.3
+  },
+  "per_city": {
+    "NYC": {
+      "return_pct": 235.3346984985266,
+      "max_drawdown": 4.863374572337537,
+      "win_rate": 83.33333333333334,
+      "total_trades": 24,
+      "profit_factor": 11.882748490897818,
+      "avg_edge": 11.133431817664208,
+      "unit": "fahrenheit"
+    },
+    "Miami": {
+      "return_pct": 0,
+      "max_drawdown": 0,
+      "win_rate": 0,
+      "total_trades": 0,
+      "profit_factor": 0,
+      "avg_edge": 0,
+      "unit": "fahrenheit"
+    },
+    "Atlanta": {
+      "return_pct": 0,
+      "max_drawdown": 0,
+      "win_rate": 0,
+      "total_trades": 0,
+      "profit_factor": 0,
+      "avg_edge": 0,
+      "unit": "fahrenheit"
+    },
+    "Chicago": {
+      "return_pct": 0,
+      "max_drawdown": 0,
+      "win_rate": 0,
+      "total_trades": 0,
+      "profit_factor": 0,
+      "avg_edge": 0,
+      "unit": "fahrenheit"
+    },
+    "Dallas": {
+      "return_pct": 0,
+      "max_drawdown": 0,
+      "win_rate": 0,
+      "total_trades": 0,
+      "profit_factor": 0,
+      "avg_edge": 0,
+      "unit": "fahrenheit"
+    },
+    "Seattle": {
+      "return_pct": 0,
+      "max_drawdown": 0,
+      "win_rate": 0,
+      "total_trades": 0,
+      "profit_factor": 0,
+      "avg_edge": 0,
+      "unit": "fahrenheit"
+    },
+    "London": {
+      "return_pct": 472.6731503040023,
+      "max_drawdown": 0.9812858303621265,
+      "win_rate": 92.10526315789474,
+      "total_trades": 38,
+      "profit_factor": 18.706971293543344,
+      "avg_edge": 19.322440887703635,
+      "unit": "celsius"
+    },
+    "Paris": {
+      "return_pct": 831.810778746463,
+      "max_drawdown": 4.198066876900331,
+      "win_rate": 78.94736842105263,
+      "total_trades": 38,
+      "profit_factor": 12.59723203761036,
+      "avg_edge": 22.133246647889152,
+      "unit": "celsius"
+    },
+    "Munich": {
+      "return_pct": 973.2617816199314,
+      "max_drawdown": 2.3334106215746315,
+      "win_rate": 77.41935483870968,
+      "total_trades": 62,
+      "profit_factor": 8.307879539816003,
+      "avg_edge": 16.457734170969687,
+      "unit": "celsius"
+    },
+    "Ankara": {
+      "return_pct": 1012.7806482713007,
+      "max_drawdown": 1.9745102470903788,
+      "win_rate": 72.22222222222221,
+      "total_trades": 36,
+      "profit_factor": 13.62598261553631,
+      "avg_edge": 17.641245659298825,
+      "unit": "celsius"
+    },
+    "Tel Aviv": {
+      "return_pct": 418.8091624836684,
+      "max_drawdown": 4.558997602973005,
+      "win_rate": 76.92307692307693,
+      "total_trades": 39,
+      "profit_factor": 7.163183822075188,
+      "avg_edge": 15.973332106681953,
+      "unit": "celsius"
+    },
+    "Toronto": {
+      "return_pct": 1450.237990666865,
+      "max_drawdown": 3.0885058047465384,
+      "win_rate": 69.86301369863014,
+      "total_trades": 73,
+      "profit_factor": 7.644973395432835,
+      "avg_edge": 16.84445404416744,
+      "unit": "celsius"
+    },
+    "Buenos Aires": {
+      "return_pct": 980.2636925419529,
+      "max_drawdown": 4.308879781693144,
+      "win_rate": 78.18181818181819,
+      "total_trades": 55,
+      "profit_factor": 9.596322394185753,
+      "avg_edge": 17.918528138782545,
+      "unit": "celsius"
+    },
+    "Sao Paulo": {
+      "return_pct": 839.8902442197987,
+      "max_drawdown": 8.694191911514862,
+      "win_rate": 71.73913043478261,
+      "total_trades": 46,
+      "profit_factor": 8.71611052499565,
+      "avg_edge": 16.47876365871309,
+      "unit": "celsius"
+    },
+    "Seoul": {
+      "return_pct": 629.5924603422848,
+      "max_drawdown": 7.093876254549112,
+      "win_rate": 68.0,
+      "total_trades": 25,
+      "profit_factor": 11.29441311429103,
+      "avg_edge": 15.39128472325836,
+      "unit": "celsius"
+    },
+    "Shanghai": {
+      "return_pct": 1050.5133357778066,
+      "max_drawdown": 1.6549324673447374,
+      "win_rate": 75.0,
+      "total_trades": 48,
+      "profit_factor": 10.873251113343278,
+      "avg_edge": 19.512635305068436,
+      "unit": "celsius"
+    },
+    "Tokyo": {
+      "return_pct": 1384.895383403769,
+      "max_drawdown": 2.6011631823068493,
+      "win_rate": 70.0,
+      "total_trades": 80,
+      "profit_factor": 7.30644266174209,
+      "avg_edge": 17.77200536231092,
+      "unit": "celsius"
+    },
+    "Singapore": {
+      "return_pct": 591.9950608296499,
+      "max_drawdown": 4.318179469995084,
+      "win_rate": 74.4186046511628,
+      "total_trades": 43,
+      "profit_factor": 7.15934857735321,
+      "avg_edge": 19.292508893381235,
+      "unit": "celsius"
+    },
+    "Lucknow": {
+      "return_pct": 503.53122750712214,
+      "max_drawdown": 1.8618588229217519,
+      "win_rate": 83.33333333333334,
+      "total_trades": 42,
+      "profit_factor": 9.934248594152166,
+      "avg_edge": 14.89140052052983,
+      "unit": "celsius"
+    },
+    "Wellington": {
+      "return_pct": 447.77592500231646,
+      "max_drawdown": 4.3718762015431185,
+      "win_rate": 85.71428571428571,
+      "total_trades": 35,
+      "profit_factor": 10.029749409776395,
+      "avg_edge": 21.536402251566802,
+      "unit": "celsius"
+    }
+  }
+}

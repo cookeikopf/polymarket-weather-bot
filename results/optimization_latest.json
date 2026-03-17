@@ -1,0 +1,72 @@
+{
+  "Conservative": {
+    "params": {
+      "min_edge": 0.1,
+      "kelly_fraction": 0.15,
+      "max_position_pct": 0.05,
+      "min_ensemble_agreement": 0.7
+    },
+    "score": 370.9785592585189,
+    "return": 10.611279629259457,
+    "max_drawdown": 0.0,
+    "win_rate": 100.0,
+    "trades": 3,
+    "sharpe": 0
+  },
+  "Moderate": {
+    "params": {
+      "min_edge": 0.07,
+      "kelly_fraction": 0.2,
+      "max_position_pct": 0.08,
+      "min_ensemble_agreement": 0.6
+    },
+    "score": 5.668402308424594,
+    "return": 29.635884819429,
+    "max_drawdown": 3.1211647534328764,
+    "win_rate": 65.0,
+    "trades": 20,
+    "sharpe": 6.859143744096784
+  },
+  "Balanced": {
+    "params": {
+      "min_edge": 0.05,
+      "kelly_fraction": 0.25,
+      "max_position_pct": 0.1,
+      "min_ensemble_agreement": 0.5
+    },
+    "score": 79.41282430424182,
+    "return": 695.4895456989702,
+    "max_drawdown": 3.2350686842789953,
+    "win_rate": 66.66666666666666,
+    "trades": 78,
+    "sharpe": 12.394988732697321
+  },
+  "Aggressive": {
+    "params": {
+      "min_edge": 0.03,
+      "kelly_fraction": 0.35,
+      "max_position_pct": 0.15,
+      "min_ensemble_agreement": 0.4
+    },
+    "score": 198.8134140238358,
+    "return": 3763.7056276058133,
+    "max_drawdown": 6.728998117433988,
+    "win_rate": 66.86746987951807,
+    "trades": 332,
+    "sharpe": 8.034608369517798
+  },
+  "Ultra-Selective": {
+    "params": {
+      "min_edge": 0.15,
+      "kelly_fraction": 0.1,
+      "max_position_pct": 0.05,
+      "min_ensemble_agreement": 0.7
+    },
+    "score": 0.0,
+    "return": 0,
+    "max_drawdown": 0,
+    "win_rate": 0,
+    "trades": 0,
+    "sharpe": 0
+  }
+}
