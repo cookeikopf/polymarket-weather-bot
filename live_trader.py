@@ -72,7 +72,7 @@ class LiveTrader:
         self.edge_detector = EdgeDetector()
 
         # Portfolio state
-        self.bankroll = config.BACKTEST_INITIAL_BANKROLL
+        self.bankroll = config.LIVE_BANKROLL if not paper_mode else config.BACKTEST_INITIAL_BANKROLL
         self.positions: List[Position] = []
         self.trade_history: List[TradeRecord] = []
         self.peak_bankroll = self.bankroll
@@ -103,32 +103,39 @@ class LiveTrader:
             self._init_clob_client()
 
     def _init_clob_client(self):
-        """Initialize Polymarket CLOB client for live trading."""
+        """Initialize Polymarket CLOB client for live trading.
+
+        Authentication setup:
+        - Uses PRIVATE_KEY exported from Polymarket (reveal.polymarket.com)
+        - FUNDER_ADDRESS = your Polymarket proxy wallet (from profile URL)
+        - SIGNATURE_TYPE: 0=EOA, 1=POLY_PROXY (email login), 2=GNOSIS_SAFE (browser wallet)
+        """
         if not config.PRIVATE_KEY:
             raise ValueError("PRIVATE_KEY not set in .env file")
 
         try:
             from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import ApiCreds
 
-            temp_client = ClobClient(
-                config.POLYMARKET_HOST,
-                key=config.PRIVATE_KEY,
-                chain_id=config.CHAIN_ID,
-            )
-            creds = temp_client.derive_api_key()
+            # Build init kwargs
+            init_kwargs = {
+                "host": config.POLYMARKET_HOST,
+                "key": config.PRIVATE_KEY,
+                "chain_id": config.CHAIN_ID,
+            }
 
-            self.clob_client = ClobClient(
-                config.POLYMARKET_HOST,
-                key=config.PRIVATE_KEY,
-                chain_id=config.CHAIN_ID,
-                creds=ApiCreds(
-                    api_key=creds.api_key,
-                    api_secret=creds.api_secret,
-                    api_passphrase=creds.api_passphrase,
-                ),
-            )
+            # Add funder/signature type if configured
+            if config.FUNDER_ADDRESS:
+                init_kwargs["funder"] = config.FUNDER_ADDRESS
+                init_kwargs["signature_type"] = config.SIGNATURE_TYPE
+
+            # Create temp client to derive API creds
+            temp_client = ClobClient(**init_kwargs)
+            temp_client.set_api_creds(temp_client.create_or_derive_api_creds())
+
+            self.clob_client = temp_client
             print("  CLOB client initialized successfully")
+            print(f"  Funder: {config.FUNDER_ADDRESS[:10]}..." if config.FUNDER_ADDRESS else "  Funder: (EOA mode)")
+
         except Exception as e:
             print(f"  ERROR: Failed to initialize CLOB client: {e}")
             print("  Falling back to paper trading mode")
@@ -373,36 +380,80 @@ class LiveTrader:
               f"Edge: {signal.edge:.1%}")
 
     def _live_execute(self, signal: TradingSignal):
-        """Execute a live trade on Polymarket CLOB."""
+        """Execute a live trade on Polymarket CLOB.
+
+        Key details for neg-risk weather markets:
+        - Must pass PartialCreateOrderOptions(neg_risk=True, tick_size=...)
+        - BUY_YES: buy the YES token at market price
+        - BUY_NO: buy the NO token at (1 - market_price)
+        - tick_size comes from market.minimum_tick_size (typically 0.001)
+        - min order size is market.order_min_size shares (typically 5)
+        """
         if not self.clob_client:
             print("  ERROR: CLOB client not initialized")
             return
 
         try:
-            from py_clob_client.clob_types import OrderArgs, OrderType
+            from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
             from py_clob_client.order_builder.constants import BUY, SELL
 
-            # Determine token and side
+            # Determine token, side, and price based on direction
             if signal.direction == "BUY_YES":
-                token_id = signal.outcome.token_id
+                token_id = signal.outcome.token_id  # YES token
                 side = BUY
                 price = signal.market_price
             else:
-                token_id = signal.outcome.token_id
-                side = SELL
-                price = signal.market_price
+                # BUY_NO: buy the NO token directly
+                token_id = signal.outcome.no_token_id  # NO token
+                if not token_id:
+                    print(f"  ERROR: No NO token ID for '{signal.outcome.name}'")
+                    return
+                side = BUY
+                price = 1.0 - signal.market_price  # NO price = 1 - YES price
 
+            # Determine tick_size from market data
+            tick_size = signal.market.minimum_tick_size or "0.001"
+
+            # Round price to tick_size precision
+            tick = float(tick_size)
+            price = round(round(price / tick) * tick, 4)
+
+            # Ensure price is within valid bounds
+            price = max(tick, min(price, 1.0 - tick))
+
+            # Calculate number of shares (size = dollar_amount / price)
             size = signal.suggested_size_usd / price
 
+            # Enforce minimum order size
+            min_size = getattr(signal.market, 'order_min_size', 5.0)
+            if size < min_size:
+                print(f"  Skipping: order size {size:.1f} shares < minimum {min_size}")
+                return
+
+            # Round size to 2 decimal places
+            size = round(size, 2)
+
             order_args = OrderArgs(
-                price=round(price, 2),
-                size=round(size, 2),
+                price=price,
+                size=size,
                 side=side,
                 token_id=token_id,
             )
 
-            resp = self.clob_client.create_and_post_order(order_args)
-            print(f"  [LIVE] Order submitted: {resp}")
+            # CRITICAL: pass neg_risk and tick_size for weather markets
+            options = PartialCreateOrderOptions(
+                neg_risk=signal.market.neg_risk if signal.market.neg_risk else False,
+                tick_size=tick_size,
+            )
+
+            print(f"  [LIVE] Submitting: {signal.direction} '{signal.outcome.name}' "
+                  f"@ {price:.4f} x {size:.2f} shares (${signal.suggested_size_usd:.2f})")
+            print(f"         neg_risk={options.neg_risk}, tick_size={tick_size}")
+
+            # Two-step: create_order then post_order for better error handling
+            signed_order = self.clob_client.create_order(order_args, options)
+            resp = self.clob_client.post_order(signed_order, OrderType.GTC)
+            print(f"  [LIVE] Response: {resp}")
 
             if resp.get("success"):
                 position = Position(
@@ -422,9 +473,15 @@ class LiveTrader:
                 )
                 self.positions.append(position)
                 self._save_state()
+                print(f"  [LIVE] Position opened successfully")
+            else:
+                error_msg = resp.get("errorMsg", "Unknown error")
+                print(f"  [LIVE] Order rejected: {error_msg}")
 
         except Exception as e:
+            import traceback
             print(f"  ERROR: Live execution failed: {e}")
+            traceback.print_exc()
 
     # ═══════════════════════════════════════════════════════════════
     # SMART EXIT STRATEGY

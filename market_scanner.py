@@ -22,9 +22,10 @@ import config
 @dataclass
 class MarketOutcome:
     """Single outcome in a multi-outcome weather market."""
-    token_id: str
+    token_id: str       # YES token ID
     name: str
-    price: float  # Current market price (0-1)
+    price: float        # Current market price (0-1)
+    no_token_id: str = ""  # NO token ID (for BUY_NO trades)
     low_bound: Optional[float] = None
     high_bound: Optional[float] = None
 
@@ -46,7 +47,8 @@ class WeatherMarket:
     liquidity: float
     outcomes: List[MarketOutcome] = field(default_factory=list)
     neg_risk: bool = False
-    minimum_tick_size: str = "0.01"
+    minimum_tick_size: str = "0.001"  # Default for weather markets
+    order_min_size: float = 5.0       # Minimum order size in shares
     unit: str = "°F"
 
 
@@ -151,6 +153,10 @@ class MarketScanner:
         # Parse outcomes from all sub-markets
         outcomes = self._parse_outcomes(sub_markets, market_type, unit)
 
+        # Get tick size and min order size from API
+        tick_size = str(first_market.get("orderPriceMinTickSize") or first_market.get("minimum_tick_size") or "0.001")
+        order_min_size = float(first_market.get("orderMinSize", 5))
+
         return WeatherMarket(
             event_id=str(event.get("id", "")),
             condition_id=first_market.get("conditionId", ""),
@@ -166,7 +172,8 @@ class MarketScanner:
             liquidity=float(event.get("liquidity", 0)),
             outcomes=outcomes,
             neg_risk=first_market.get("negRisk", False),
-            minimum_tick_size=str(first_market.get("minimum_tick_size", "0.01")),
+            minimum_tick_size=tick_size,
+            order_min_size=order_min_size,
             unit=unit,
         )
 
@@ -191,9 +198,10 @@ class MarketScanner:
                     yes_price = float(outcome_prices[0]) if outcome_prices else 0.5
 
                     outcomes.append(MarketOutcome(
-                        token_id=token_ids[0],  # YES token
+                        token_id=token_ids[0],    # YES token
                         name=outcome_name,
                         price=yes_price,
+                        no_token_id=token_ids[1],  # NO token
                         low_bound=low,
                         high_bound=high,
                     ))
@@ -289,7 +297,12 @@ class MarketScanner:
         return {"bids": [], "asks": []}
 
     def fetch_orderbook_depth(self, token_id: str) -> Dict:
-        """Fetch orderbook and compute depth metrics for liquidity checks."""
+        """Fetch orderbook and compute depth metrics for liquidity checks.
+
+        For neg-risk tokens, the raw orderbook has unusual structure
+        (bids near 0, asks near 1), so we also check the CLOB price
+        endpoints which give effective market prices.
+        """
         book = self.fetch_orderbook(token_id)
         bids = book.get("bids", [])
         asks = book.get("asks", [])
@@ -300,12 +313,34 @@ class MarketScanner:
         best_ask = float(asks[0]["price"]) if asks else 1
         spread = best_ask - best_bid if bids and asks else 1.0
 
+        # For neg-risk markets, also check effective CLOB prices
+        effective_bid = best_bid
+        effective_ask = best_ask
+        try:
+            buy_resp = requests.get(
+                f"{config.POLYMARKET_HOST}/price",
+                params={"token_id": token_id, "side": "BUY"},
+                timeout=5,
+            )
+            sell_resp = requests.get(
+                f"{config.POLYMARKET_HOST}/price",
+                params={"token_id": token_id, "side": "SELL"},
+                timeout=5,
+            )
+            if buy_resp.status_code == 200 and sell_resp.status_code == 200:
+                effective_bid = float(buy_resp.json().get("price", best_bid))
+                effective_ask = float(sell_resp.json().get("price", best_ask))
+        except Exception:
+            pass
+
+        effective_spread = effective_ask - effective_bid if effective_ask > effective_bid else spread
+
         return {
             "bid_depth": bid_depth,
             "ask_depth": ask_depth,
-            "best_bid": best_bid,
-            "best_ask": best_ask,
-            "spread": spread,
+            "best_bid": effective_bid,
+            "best_ask": effective_ask,
+            "spread": effective_spread,
             "has_liquidity": bid_depth > 0 and ask_depth > 0,
         }
 

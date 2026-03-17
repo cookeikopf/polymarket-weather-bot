@@ -116,12 +116,27 @@ def cmd_live(duration: int = 60):
 
     if not config.PRIVATE_KEY:
         print("ERROR: Set POLYMARKET_PRIVATE_KEY in .env file")
-        print("  echo 'POLYMARKET_PRIVATE_KEY=0x...' > .env")
+        print("  1. Export your key from https://reveal.polymarket.com")
+        print("  2. Copy .env.example to .env and fill in your values")
         sys.exit(1)
 
-    print("⚠️  LIVE TRADING MODE - Real money at risk!")
-    print(f"  Duration: {duration} minutes")
-    print(f"  Bankroll: ${config.BACKTEST_INITIAL_BANKROLL}")
+    if not config.FUNDER_ADDRESS:
+        print("WARNING: POLYMARKET_FUNDER_ADDRESS not set in .env")
+        print("  Your funder address is your Polymarket profile address")
+        print("  (NOT your MetaMask deposit address!)")
+        print("  Find it at: polymarket.com/profile/<YOUR_ADDRESS>")
+        print("  Continuing in EOA mode...\n")
+
+    print("\n" + "=" * 55)
+    print("  ⚠️  LIVE TRADING MODE — Real money at risk!")
+    print("=" * 55)
+    print(f"  Duration:     {duration} minutes")
+    print(f"  Bankroll:     ${config.LIVE_BANKROLL:.2f}")
+    print(f"  Max per trade: ${config.MAX_TRADE_SIZE_USDC:.2f}")
+    print(f"  Max exposure:  {config.MAX_TOTAL_EXPOSURE:.0%} = ${config.LIVE_BANKROLL * config.MAX_TOTAL_EXPOSURE:.2f}")
+    print(f"  Max drawdown:  {config.MAX_DRAWDOWN_PCT:.0%} = ${config.LIVE_BANKROLL * config.MAX_DRAWDOWN_PCT:.2f}")
+    print(f"  Funder:        {config.FUNDER_ADDRESS[:10] + '...' if config.FUNDER_ADDRESS else 'EOA'}")
+    print("=" * 55)
     confirm = input("  Type 'YES' to confirm: ")
     if confirm != "YES":
         print("Aborted.")
@@ -160,8 +175,11 @@ def cmd_status():
     print(f"  Max Position:         {config.MAX_POSITION_PCT:.0%}")
     print(f"  Max Drawdown:         {config.MAX_DRAWDOWN_PCT:.0%}")
     print(f"  Scan Interval:        {config.SCAN_INTERVAL_SECONDS}s")
-    print(f"  Initial Bankroll:     ${config.BACKTEST_INITIAL_BANKROLL}")
+    print(f"  Live Bankroll:        ${config.LIVE_BANKROLL}")
+    print(f"  Max Trade Size:       ${config.MAX_TRADE_SIZE_USDC}")
     print(f"  Private Key Set:      {'Yes' if config.PRIVATE_KEY else 'No'}")
+    print(f"  Funder Address Set:   {'Yes' if config.FUNDER_ADDRESS else 'No'}")
+    print(f"  Signature Type:       {config.SIGNATURE_TYPE}")
     print(f"{'='*50}\n")
 
 

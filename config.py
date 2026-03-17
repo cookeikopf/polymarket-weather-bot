@@ -18,6 +18,13 @@ CHAIN_ID = 137  # Polygon mainnet
 PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 POLYMARKET_GEO_TOKEN = os.getenv("POLYMARKET_GEO_TOKEN", "")
 
+# Polymarket wallet/funder address (the Polymarket proxy wallet, NOT your MetaMask)
+# Found in your Polymarket profile URL: https://polymarket.com/profile/<THIS_ADDRESS>
+FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", "")
+
+# Signature type: 0=EOA, 1=POLY_PROXY (Magic/email login), 2=GNOSIS_SAFE (browser wallet)
+SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))
+
 # ═══════════════════════════════════════════════════════════════════
 # WEATHER DATA SOURCES (Open-Meteo - Free, no API key needed)
 # ═══════════════════════════════════════════════════════════════════
@@ -229,10 +236,11 @@ MAX_CONCURRENT_POSITIONS = 8
 MAX_TOTAL_EXPOSURE = 0.40  # Max 40% of bankroll at risk
 
 # Minimum trade size in USDC
-MIN_TRADE_SIZE_USDC = 1.0
+# Note: Polymarket orderMinSize is typically 5 shares, which at price 0.30 = $1.50
+MIN_TRADE_SIZE_USDC = 2.0
 
 # Maximum trade size in USDC
-MAX_TRADE_SIZE_USDC = 100.0  # Weather markets have limited liquidity
+MAX_TRADE_SIZE_USDC = 25.0  # Conservative for weather markets; increase as you gain confidence
 
 # ═══════════════════════════════════════════════════════════════════
 # RISK MANAGEMENT
@@ -254,7 +262,8 @@ TRAILING_STOP_PCT = 0.30  # 30% of peak unrealized profit
 # ═══════════════════════════════════════════════════════════════════
 BACKTEST_START_DATE = "2024-01-01"
 BACKTEST_END_DATE = "2026-03-15"
-BACKTEST_INITIAL_BANKROLL = 1000.0  # $1000 starting capital
+BACKTEST_INITIAL_BANKROLL = 50.0  # Starting capital (adjustable via .env)
+LIVE_BANKROLL = float(os.getenv("POLYMARKET_BANKROLL", "50.0"))  # Live trading bankroll
 
 # Simulated market parameters
 SIM_SPREAD = 0.06        # 6% bid-ask spread (realistic for weather markets)
