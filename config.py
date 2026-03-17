@@ -318,3 +318,39 @@ MAX_POSITIONS_PER_ZONE = 3
 
 # Slug-based market discovery: number of days ahead to scan
 MARKET_SCAN_DAYS_AHEAD = 7
+
+# ═══════════════════════════════════════════════════════════════════
+# WEATHER UNDERGROUND (Resolution Data Source)
+# ═══════════════════════════════════════════════════════════════════
+WU_API_KEY = "e1f10a1e78da46f5b10a1e78da96f525"
+WU_API_BASE = "https://api.weather.com/v1/location"
+
+# WU station IDs (ICAO:9:COUNTRY) mapped to our station IDs
+WU_STATIONS = {
+    "NYC":          {"wu": "KLGA:9:US", "units": "e"},
+    "Miami":        {"wu": "KMIA:9:US", "units": "e"},
+    "Atlanta":      {"wu": "KATL:9:US", "units": "e"},
+    "Chicago":      {"wu": "KORD:9:US", "units": "e"},
+    "Dallas":       {"wu": "KDFW:9:US", "units": "e"},
+    "Seattle":      {"wu": "KSEA:9:US", "units": "e"},
+    "London":       {"wu": "EGLL:9:GB", "units": "m"},
+    "Paris":        {"wu": "LFPG:9:FR", "units": "m"},
+    "Munich":       {"wu": "EDDM:9:DE", "units": "m"},
+    "Ankara":       {"wu": "LTAC:9:TR", "units": "m"},
+    "Tel Aviv":     {"wu": "LLBG:9:IL", "units": "m"},
+    "Toronto":      {"wu": "CYYZ:9:CA", "units": "m"},
+    "Buenos Aires": {"wu": "SAEZ:9:AR", "units": "m"},
+    "Sao Paulo":    {"wu": "SBGR:9:BR", "units": "m"},
+    "Seoul":        {"wu": "RKSI:9:KR", "units": "m"},
+    "Shanghai":     {"wu": "ZSPD:9:CN", "units": "m"},
+    "Tokyo":        {"wu": "RJTT:9:JP", "units": "m"},
+    "Singapore":    {"wu": "WSSS:9:SG", "units": "m"},
+    "Lucknow":      {"wu": "VILK:9:IN", "units": "m"},
+    "Wellington":   {"wu": "NZWN:9:NZ", "units": "m"},
+}
+
+# ML Model
+ML_MODEL_PATH = "data/ml_model.pkl"
+ML_FEATURES_PATH = "data/ml_features.csv"
+WU_DATA_DIR = "data/wu_historical"
+WU_CACHE_DIR = "data/wu_cache"
