@@ -225,7 +225,7 @@ TEMP_BUCKET_SIZE_F = 2
 # EDGE DETECTION & TRADING SIGNALS
 # ═══════════════════════════════════════════════════════════════════
 # Minimum edge (our prob - market prob) to enter a trade
-MIN_EDGE_PCT = 0.05  # 5% minimum edge
+MIN_EDGE_PCT = 0.04  # 4% minimum edge (weather: 0 fees = lower threshold profitable)
 
 # Minimum absolute probability for a bucket to be tradeable
 MIN_PROBABILITY = 0.03  # Don't trade on < 3% outcomes
@@ -234,29 +234,29 @@ MIN_PROBABILITY = 0.03  # Don't trade on < 3% outcomes
 MAX_ENTRY_PRICE = 0.92
 
 # Confidence threshold (0-1) from ensemble agreement
-MIN_ENSEMBLE_AGREEMENT = 0.60  # At least 60% of models should roughly agree
+MIN_ENSEMBLE_AGREEMENT = 0.50  # 50% agreement (relaxed: 20 cities provide diversification)
 
 # ═══════════════════════════════════════════════════════════════════
 # KELLY CRITERION & POSITION SIZING
 # ═══════════════════════════════════════════════════════════════════
 # Fractional Kelly (full Kelly is too aggressive)
-KELLY_FRACTION = 0.25  # Quarter Kelly - conservative
+KELLY_FRACTION = 0.20  # Fifth Kelly — conservative, smoother equity curve
 
 # Maximum position size as fraction of bankroll
 MAX_POSITION_PCT = 0.10  # Max 10% per trade
 
 # Maximum number of concurrent positions
-MAX_CONCURRENT_POSITIONS = 8
+MAX_CONCURRENT_POSITIONS = 10  # Increased for 20-city coverage
 
 # Maximum total exposure (sum of all positions / bankroll)
-MAX_TOTAL_EXPOSURE = 0.40  # Max 40% of bankroll at risk
+MAX_TOTAL_EXPOSURE = 0.50  # Max 50% (diversified across 20 cities)
 
 # Minimum trade size in USDC
 # Note: Polymarket orderMinSize is typically 5 shares, which at price 0.30 = $1.50
 MIN_TRADE_SIZE_USDC = 2.0
 
 # Maximum trade size in USDC
-MAX_TRADE_SIZE_USDC = 25.0  # Conservative for weather markets; increase as you gain confidence
+MAX_TRADE_SIZE_USDC = 15.0  # Conservative for $50 bankroll; increase proportionally
 
 # ═══════════════════════════════════════════════════════════════════
 # RISK MANAGEMENT
