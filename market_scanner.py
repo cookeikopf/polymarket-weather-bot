@@ -282,6 +282,57 @@ class MarketScanner:
             prices[outcome.name] = outcome.price
         return prices
 
+    def enrich_with_live_prices(self, markets: List[WeatherMarket]) -> List[WeatherMarket]:
+        """Replace stale Gamma API prices with live CLOB orderbook prices.
+
+        The Gamma API `outcomePrices` field returns cached/stale prices that
+        can diverge significantly from actual orderbook prices. This method
+        fetches the real mid-price from the CLOB for each outcome.
+
+        CRITICAL: Must be called BEFORE edge detection to avoid phantom trades
+        at prices that don't exist in the orderbook.
+        """
+        enriched = 0
+        skipped = 0
+
+        for market in markets:
+            for outcome in market.outcomes:
+                # Skip simulated tokens (backtesting)
+                if outcome.token_id.startswith("sim_"):
+                    continue
+
+                # Fetch live orderbook for the YES token
+                depth = self.fetch_orderbook_depth(outcome.token_id)
+
+                if not depth["has_liquidity"]:
+                    # No liquidity — mark price as -1 so edge detector skips it
+                    outcome.price = -1.0
+                    skipped += 1
+                    continue
+
+                # Use mid-price between best bid and best ask as the live price
+                live_mid = (depth["best_bid"] + depth["best_ask"]) / 2.0
+
+                # Sanity check: price must be between 0.01 and 0.99
+                if 0.01 <= live_mid <= 0.99:
+                    old_price = outcome.price
+                    outcome.price = round(live_mid, 4)
+                    if abs(old_price - live_mid) > 0.03:
+                        print(f"    PRICE FIX: {outcome.name} | "
+                              f"Gamma: {old_price:.3f} → CLOB: {live_mid:.3f} "
+                              f"(delta: {abs(old_price - live_mid):.3f})")
+                    enriched += 1
+                else:
+                    skipped += 1
+
+                # Also store spread info for later liquidity checks
+                outcome._clob_spread = depth["spread"]
+                outcome._clob_bid = depth["best_bid"]
+                outcome._clob_ask = depth["best_ask"]
+
+        print(f"  CLOB price enrichment: {enriched} updated, {skipped} skipped (no liquidity)")
+        return markets
+
     def fetch_orderbook(self, token_id: str) -> Dict:
         """Fetch orderbook for a specific token from CLOB API."""
         try:

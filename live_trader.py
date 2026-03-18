@@ -194,6 +194,10 @@ class LiveTrader:
             print("  No weather markets found. Waiting...")
             return []
 
+        # 1b. CRITICAL: Replace stale Gamma API prices with live CLOB orderbook prices
+        print("\n[1b/4] Fetching live CLOB orderbook prices...")
+        markets = self.scanner.enrich_with_live_prices(markets)
+
         all_signals = []
 
         for market in markets:
@@ -392,14 +396,32 @@ class LiveTrader:
         return zone_positions < max_per_zone
 
     def _paper_execute(self, signal: TradingSignal):
-        """Execute a paper trade."""
+        """Execute a paper trade.
+
+        Uses signal.market_price which has been enriched with live CLOB prices
+        by enrich_with_live_prices() in the scan cycle.
+        For BUY_NO, entry_price = 1 - YES_price (the NO share cost).
+        """
+        if signal.direction == "BUY_YES":
+            entry_price = signal.market_price  # YES price from CLOB
+            token_id = signal.outcome.token_id
+        else:
+            entry_price = 1.0 - signal.market_price  # NO price = 1 - YES CLOB price
+            token_id = signal.outcome.no_token_id or signal.outcome.token_id
+
+        if entry_price <= 0 or entry_price >= 1:
+            print(f"  [PAPER] Skipping '{signal.outcome.name}': invalid entry_price={entry_price:.3f}")
+            return
+
+        shares = signal.suggested_size_usd / entry_price
+
         position = Position(
             market_slug=signal.market.slug,
             outcome_name=signal.outcome.name,
-            token_id=signal.outcome.token_id,
+            token_id=token_id,
             direction=signal.direction,
-            entry_price=signal.market_price,
-            shares=signal.suggested_size_usd / signal.market_price,
+            entry_price=entry_price,
+            shares=shares,
             size_usd=signal.suggested_size_usd,
             edge_at_entry=signal.edge,
             confidence=signal.confidence,
@@ -412,7 +434,7 @@ class LiveTrader:
         self._save_state()
 
         print(f"  [PAPER] {signal.direction} '{signal.outcome.name}' "
-              f"@ {signal.market_price:.3f} | "
+              f"@ {entry_price:.3f} (YES={signal.market_price:.3f}) | "
               f"Size: ${signal.suggested_size_usd:.2f} | "
               f"Edge: {signal.edge:.1%}")
 
@@ -441,7 +463,6 @@ class LiveTrader:
             if signal.direction == "BUY_YES":
                 token_id = signal.outcome.token_id  # YES token
                 side = BUY
-                base_price = signal.market_price
             else:
                 # BUY_NO: buy the NO token directly
                 token_id = signal.outcome.no_token_id  # NO token
@@ -449,7 +470,35 @@ class LiveTrader:
                     print(f"  ERROR: No NO token ID for '{signal.outcome.name}'")
                     return
                 side = BUY
-                base_price = 1.0 - signal.market_price  # NO price = 1 - YES price
+
+            # CRITICAL: Fetch LIVE orderbook price right before execution
+            # to prevent trading at stale/phantom prices
+            live_depth = self.scanner.fetch_orderbook_depth(token_id)
+            if not live_depth["has_liquidity"]:
+                print(f"  Skipping '{signal.outcome.name}': no liquidity in orderbook")
+                return
+
+            # Use best_ask for BUY orders (that's the price we'd actually pay)
+            live_ask = live_depth["best_ask"]
+            live_bid = live_depth["best_bid"]
+            base_price = live_ask  # We're buying, so we pay the ask
+
+            # Verify the live price hasn't diverged too far from signal price
+            if signal.direction == "BUY_YES":
+                expected_price = signal.market_price
+            else:
+                expected_price = 1.0 - signal.market_price
+
+            price_divergence = abs(base_price - expected_price)
+            if price_divergence > 0.10:  # >10 cent divergence = stale signal
+                print(f"  PRICE MISMATCH: '{signal.outcome.name}' "
+                      f"signal={expected_price:.3f} vs orderbook={base_price:.3f} "
+                      f"(divergence={price_divergence:.3f}). Skipping.")
+                return
+            elif price_divergence > 0.03:
+                print(f"  PRICE DRIFT: '{signal.outcome.name}' "
+                      f"signal={expected_price:.3f} vs orderbook={base_price:.3f} "
+                      f"(drift={price_divergence:.3f}). Proceeding with live price.")
 
             # Determine tick_size from market data
             tick_size = signal.market.minimum_tick_size or "0.001"

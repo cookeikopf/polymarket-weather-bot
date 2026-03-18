@@ -67,6 +67,10 @@ class EdgeDetector:
 
             market_price = outcome.price
 
+            # Skip outcomes with no CLOB liquidity (marked -1 by enrich_with_live_prices)
+            if market_price < 0:
+                continue
+
             # Skip extreme prices (illiquid, near-certain)
             if market_price < 0.01 or market_price > self.max_entry_price:
                 continue
