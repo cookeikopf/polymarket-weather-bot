@@ -279,8 +279,8 @@ TRAILING_STOP_PCT = 0.30  # 30% of peak unrealized profit
 # ═══════════════════════════════════════════════════════════════════
 BACKTEST_START_DATE = "2024-01-01"
 BACKTEST_END_DATE = "2026-03-15"
-BACKTEST_INITIAL_BANKROLL = 50.0  # Starting capital (adjustable via .env)
-LIVE_BANKROLL = float(os.getenv("POLYMARKET_BANKROLL", "50.0"))  # Live trading bankroll
+BACKTEST_INITIAL_BANKROLL = 100.0  # Starting capital (adjustable via .env)
+LIVE_BANKROLL = float(os.getenv("POLYMARKET_BANKROLL", "100.0"))  # Live trading bankroll
 
 # Simulated market parameters
 SIM_SPREAD = 0.06        # 6% bid-ask spread (realistic for weather markets)

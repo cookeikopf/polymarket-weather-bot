@@ -214,18 +214,27 @@ class LiveTrader:
         candidate_markets = []
         relaxed_threshold = max(0.02, config.MIN_EDGE_PCT - 0.02)  # Slightly relaxed
 
+        skip_reasons = {"no_engine": 0, "no_forecasts": 0, "no_bucket_edges": 0,
+                        "no_prob_match": 0, "edges_too_small": 0}
+
         for market in markets:
             engine = self.engines.get(market.station_id)
             if not engine:
+                skip_reasons["no_engine"] += 1
+                logger.debug(f"  SKIP {market.station_id}/{market.target_date}: no engine")
                 continue
 
             forecasts = engine.fetch_multi_model_forecasts(market.target_date)
             if not forecasts:
+                skip_reasons["no_forecasts"] += 1
+                logger.warning(f"  SKIP {market.station_id}/{market.target_date}: no forecasts returned")
                 continue
 
             ensemble_stats = engine.compute_ensemble_stats(forecasts)
             bucket_edges = self._market_to_bucket_edges(market)
             if not bucket_edges:
+                skip_reasons["no_bucket_edges"] += 1
+                logger.warning(f"  SKIP {market.station_id}/{market.target_date}: no bucket edges parsed from {len(market.outcomes)} outcomes")
                 continue
 
             our_probs = engine.compute_probability_distribution(forecasts, bucket_edges)
@@ -236,20 +245,34 @@ class LiveTrader:
             )
             if ml_probs:
                 our_probs = ml_probs
+                logger.debug(f"  {market.station_id}/{market.target_date}: using ML probabilities")
 
             # Quick screen: any outcome with potential edge?
             has_candidate = False
+            best_edge_this_market = 0
+            matched_count = 0
             for outcome in market.outcomes:
                 our_prob = self.edge_detector._match_probability(outcome.name, our_probs)
                 if our_prob is None:
                     continue
+                matched_count += 1
                 gamma_price = outcome.price
                 if gamma_price <= 0 or gamma_price >= 1:
                     continue
                 edge = abs(our_prob - gamma_price)
+                best_edge_this_market = max(best_edge_this_market, edge)
                 if edge >= relaxed_threshold:
                     has_candidate = True
                     break
+
+            if matched_count == 0:
+                skip_reasons["no_prob_match"] += 1
+                logger.warning(f"  SKIP {market.station_id}/{market.target_date}: 0/{len(market.outcomes)} outcomes matched probability labels")
+                logger.warning(f"    Outcome names: {[o.name for o in market.outcomes[:3]]}...")
+                logger.warning(f"    Our prob keys: {list(our_probs.keys())[:3]}...")
+            elif not has_candidate:
+                skip_reasons["edges_too_small"] += 1
+                logger.info(f"  {market.station_id}/{market.target_date}: best edge {best_edge_this_market:.3f} < threshold {relaxed_threshold} ({matched_count}/{len(market.outcomes)} matched)")
 
             if has_candidate:
                 # Store forecast data for Phase 2
@@ -259,6 +282,8 @@ class LiveTrader:
                 candidate_markets.append(market)
 
         logger.info(f"  {len(candidate_markets)}/{len(markets)} markets have candidate edges")
+        if any(v > 0 for v in skip_reasons.values()):
+            logger.info(f"  Skip reasons: {skip_reasons}")
 
         if not candidate_markets:
             logger.info("[5/5] No candidate edges found. Skipping CLOB enrichment.")

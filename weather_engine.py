@@ -47,15 +47,28 @@ class WeatherEngine:
     # CORE: Multi-Model Forecast Fetching
     # ═══════════════════════════════════════════════════════════════
 
+    # In-memory forecast cache: {(station_id, target_date, variable): {model: value}}
+    _forecast_cache: Dict[tuple, Dict[str, float]] = {}
+    _forecast_cache_time: Dict[tuple, float] = {}  # cache timestamps
+    CACHE_TTL_SECONDS = 3600  # Refresh forecasts every hour
+
     def fetch_multi_model_forecasts(
         self, target_date: str, variable: str = "temperature_2m_max"
     ) -> Dict[str, float]:
         """
         Fetch forecasts from multiple NWP models for a target date.
+        Results are cached in memory to avoid redundant API calls across scan cycles.
 
         Returns: {model_name: forecast_value}
         """
+        cache_key = (self.station_id, target_date, variable)
+        if cache_key in WeatherEngine._forecast_cache:
+            cache_age = time.time() - WeatherEngine._forecast_cache_time.get(cache_key, 0)
+            if cache_age < WeatherEngine.CACHE_TTL_SECONDS:
+                return WeatherEngine._forecast_cache[cache_key]
+
         forecasts = {}
+        failures = 0
 
         for model in config.WEATHER_MODELS:
             try:
@@ -78,9 +91,28 @@ class WeatherEngine:
                         values = data["daily"][variable]
                         if values and values[0] is not None:
                             forecasts[model] = float(values[0])
+                        else:
+                            failures += 1
+                    else:
+                        failures += 1
+                elif resp.status_code == 429:
+                    print(f"  WARNING: Open-Meteo rate limited (429) for {model}")
+                    failures += 1
+                    time.sleep(2)  # Back off on rate limit
+                else:
+                    failures += 1
                 time.sleep(0.2)  # Rate limiting
             except Exception as e:
                 print(f"  Warning: Failed to fetch {model}: {e}")
+                failures += 1
+
+        if failures > 0 and len(forecasts) > 0:
+            print(f"  Forecasts for {self.station_id}/{target_date}: {len(forecasts)} OK, {failures} failed")
+
+        # Cache successful results (even partial)
+        if forecasts:
+            WeatherEngine._forecast_cache[cache_key] = forecasts
+            WeatherEngine._forecast_cache_time[cache_key] = time.time()
 
         return forecasts
 
