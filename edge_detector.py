@@ -65,7 +65,7 @@ class EdgeDetector:
             if our_prob is None:
                 continue
 
-            market_price = outcome.price
+            market_price = outcome.price  # Mid-price (enriched from CLOB)
 
             # Skip outcomes with no CLOB liquidity (marked -1 by enrich_with_live_prices)
             if market_price < 0:
@@ -75,24 +75,46 @@ class EdgeDetector:
             if market_price < 0.01 or market_price > self.max_entry_price:
                 continue
 
-            # Calculate edge
-            edge = our_prob - market_price
-            edge_pct = abs(edge) / max(market_price, 0.01)
+            # Use spread-aware prices if CLOB data available
+            # _clob_ask = effective ask (what we pay for BUY_YES)
+            # _clob_bid = effective bid (what we receive for SELL_YES → relates to BUY_NO cost)
+            clob_ask = getattr(outcome, '_clob_ask', None)
+            clob_bid = getattr(outcome, '_clob_bid', None)
 
-            # Determine direction
-            if edge > 0:
-                # Our probability is higher -> Buy YES
-                direction = "BUY_YES"
-                entry_price = market_price
-                win_prob = our_prob
-                payout = 1.0 - entry_price  # Win $1 - entry_price
+            # Calculate edge accounting for spread
+            # BUY_YES: we pay the ask price, so edge = our_prob - ask
+            # BUY_NO: we pay 1 - bid for NO, so edge = (1-our_prob) vs (1-bid) → edge from YES perspective
+            if clob_ask and clob_bid:
+                # Spread-aware edge: use worst-case execution price
+                buy_yes_cost = clob_ask   # What we actually pay for YES
+                buy_no_cost = 1.0 - clob_bid  # What we actually pay for NO
+                edge_yes = our_prob - buy_yes_cost
+                edge_no = (1.0 - our_prob) - buy_no_cost  # = clob_bid - our_prob
             else:
-                # Our probability is lower -> Buy NO (sell YES equivalent)
+                # Fallback: mid-price (backtesting)
+                edge_yes = our_prob - market_price
+                edge_no = market_price - our_prob  # = (1-our_prob) - (1-market_price)
+
+            edge_pct = abs(our_prob - market_price) / max(market_price, 0.01)
+
+            # Determine direction based on which side has positive edge
+            if edge_yes > edge_no and edge_yes > 0:
+                # BUY YES
+                direction = "BUY_YES"
+                entry_price = clob_ask if clob_ask else market_price
+                win_prob = our_prob
+                payout = 1.0 - entry_price
+                edge = edge_yes
+            elif edge_no > 0:
+                # BUY NO
                 direction = "BUY_NO"
-                entry_price = 1.0 - market_price
+                entry_price = (1.0 - clob_bid) if clob_bid else (1.0 - market_price)
                 win_prob = 1.0 - our_prob
                 payout = 1.0 - entry_price
-                edge = abs(edge)  # Make edge positive for sizing
+                edge = edge_no
+            else:
+                # No positive edge on either side
+                continue
 
             # Skip if edge too small
             if edge < self.min_edge:
@@ -118,7 +140,7 @@ class EdgeDetector:
 
             # Suggested position size
             suggested_size = self._compute_position_size(
-                kelly_frac, bankroll, current_exposure, confidence
+                kelly_frac, bankroll, current_exposure, confidence, entry_price
             )
 
             # Build reasoning
@@ -288,8 +310,14 @@ class EdgeDetector:
         bankroll: float,
         current_exposure: float,
         confidence: float,
+        entry_price: float = 0.5,
     ) -> float:
-        """Compute actual position size in USDC."""
+        """Compute actual position size in USDC.
+
+        Args:
+            entry_price: Used to verify the order produces >= 5 shares
+                         (Polymarket minimum order size).
+        """
         # Kelly-based size
         kelly_size = kelly_frac * bankroll
 
@@ -306,9 +334,16 @@ class EdgeDetector:
             return 0
         size = min(size, remaining_capacity)
 
-        # Floor at minimum
-        if size < config.MIN_TRADE_SIZE_USDC:
-            return 0
+        # Ensure minimum order produces >= 5 shares (Polymarket requirement)
+        min_viable_usd = 5.0 * entry_price  # 5 shares * price per share
+        min_required = max(config.MIN_TRADE_SIZE_USDC, min_viable_usd)
+
+        # If size is below minimum but we have capacity, bump to minimum
+        if size < min_required:
+            if min_required <= remaining_capacity and min_required <= config.MAX_TRADE_SIZE_USDC:
+                size = min_required
+            else:
+                return 0  # Can't meet minimum
 
         return round(size, 2)
 

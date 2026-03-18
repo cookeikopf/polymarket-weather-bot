@@ -436,6 +436,86 @@ class WeatherEngine:
         }
 
     # ═══════════════════════════════════════════════════════════════
+    # ML MODEL INTEGRATION
+    # ═══════════════════════════════════════════════════════════════
+
+    def compute_ml_probability_distribution(
+        self,
+        forecasts: Dict[str, float],
+        ensemble_stats: Dict,
+        bucket_edges: List[float],
+        target_date: str,
+    ) -> Optional[Dict[str, float]]:
+        """
+        Compute probability distribution using the trained ML model.
+
+        Falls back to None if the ML model is not available, allowing
+        the caller to use the NWP ensemble method instead.
+
+        The ML model (WeatherMLModel) produces better predictions by
+        learning systematic biases between Open-Meteo forecasts and
+        Weather Underground actuals across 20 stations.
+        """
+        try:
+            from ml_model import WeatherMLModel
+        except ImportError:
+            return None
+
+        # Load model from disk (cached after first load)
+        if not hasattr(self, '_ml_model'):
+            self._ml_model = None
+            try:
+                ml = WeatherMLModel()
+                ml.load(config.ML_MODEL_PATH)
+                if ml.is_trained:
+                    self._ml_model = ml
+            except (FileNotFoundError, Exception):
+                pass  # Model not available
+
+        if self._ml_model is None:
+            return None
+
+        # Build feature dict from current forecast data
+        is_fahrenheit = self.unit == "fahrenheit"
+        target = pd.Timestamp(target_date)
+
+        # Get WU bias info for this station
+        wu_bias_info = self._ml_model.station_biases.get(self.station_id, {})
+
+        features = {
+            "om_high_temp": ensemble_stats.get("mean", 0),
+            "om_low_temp": ensemble_stats.get("mean", 0) - 10,  # Approximate
+            "om_mean_temp": ensemble_stats.get("mean", 0) - 5,  # Approximate
+            "om_precip": 0,  # Not available from ensemble
+            "om_wind_max": 0,
+            "om_rh_mean": 50,
+            "om_pressure_mean": 1013,
+            "station_lat": self.lat,
+            "station_lon": self.lon,
+            "is_fahrenheit": 1.0 if is_fahrenheit else 0.0,
+            "wu_bias": wu_bias_info.get("mean_bias", 0),
+            "wu_bias_std": wu_bias_info.get("std", 2.0),
+            "sin_doy": np.sin(2 * np.pi * target.dayofyear / 365.25),
+            "cos_doy": np.cos(2 * np.pi * target.dayofyear / 365.25),
+            "month": target.month,
+            "om_temp_lag1": ensemble_stats.get("mean", 0),  # Best estimate
+            "om_temp_lag3_mean": ensemble_stats.get("mean", 0),
+            "om_temp_lag7_mean": ensemble_stats.get("mean", 0),
+            "om_temp_change": 0,
+            "temp_anomaly": 0,
+            "station_code": hash(self.station_id) % 1000,
+            "station_id": self.station_id,
+        }
+
+        try:
+            ml_probs = self._ml_model.predict_bucket_probs(
+                features, bucket_edges, is_fahrenheit=is_fahrenheit
+            )
+            return ml_probs
+        except Exception:
+            return None
+
+    # ═══════════════════════════════════════════════════════════════
     # CLIMATOLOGICAL PRIOR: Bayesian base rate
     # ═══════════════════════════════════════════════════════════════
 

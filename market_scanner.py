@@ -12,9 +12,13 @@ import numpy as np
 import requests
 import re
 import json
+import time
+import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
+
+logger = logging.getLogger("weather_bot")
 
 import config
 
@@ -285,9 +289,9 @@ class MarketScanner:
     def enrich_with_live_prices(self, markets: List[WeatherMarket]) -> List[WeatherMarket]:
         """Replace stale Gamma API prices with live CLOB orderbook prices.
 
-        The Gamma API `outcomePrices` field returns cached/stale prices that
-        can diverge significantly from actual orderbook prices. This method
-        fetches the real mid-price from the CLOB for each outcome.
+        The Gamma API `outcomePrices` field can return cached/stale prices.
+        This method fetches the real effective price from the CLOB /price
+        endpoint for each outcome.
 
         CRITICAL: Must be called BEFORE edge detection to avoid phantom trades
         at prices that don't exist in the orderbook.
@@ -310,7 +314,7 @@ class MarketScanner:
                     skipped += 1
                     continue
 
-                # Use mid-price between best bid and best ask as the live price
+                # Use mid-price between effective bid and ask as the live price
                 live_mid = (depth["best_bid"] + depth["best_ask"]) / 2.0
 
                 # Sanity check: price must be between 0.01 and 0.99
@@ -318,19 +322,22 @@ class MarketScanner:
                     old_price = outcome.price
                     outcome.price = round(live_mid, 4)
                     if abs(old_price - live_mid) > 0.03:
-                        print(f"    PRICE FIX: {outcome.name} | "
-                              f"Gamma: {old_price:.3f} → CLOB: {live_mid:.3f} "
+                        logger.info(f"PRICE FIX: {outcome.name} | "
+                              f"Gamma: {old_price:.3f} -> CLOB: {live_mid:.3f} "
                               f"(delta: {abs(old_price - live_mid):.3f})")
                     enriched += 1
                 else:
                     skipped += 1
 
-                # Also store spread info for later liquidity checks
+                # Store CLOB bid/ask for spread-aware edge calculation
                 outcome._clob_spread = depth["spread"]
                 outcome._clob_bid = depth["best_bid"]
                 outcome._clob_ask = depth["best_ask"]
 
-        print(f"  CLOB price enrichment: {enriched} updated, {skipped} skipped (no liquidity)")
+                # Rate limit: avoid CLOB API burst
+                time.sleep(0.1)
+
+        logger.info(f"CLOB price enrichment: {enriched} updated, {skipped} skipped (no liquidity)")
         return markets
 
     def fetch_orderbook(self, token_id: str) -> Dict:
@@ -384,7 +391,21 @@ class MarketScanner:
         except Exception:
             pass
 
-        effective_spread = effective_ask - effective_bid if effective_ask > effective_bid else spread
+        effective_spread = abs(effective_ask - effective_bid) if effective_ask != effective_bid else spread
+
+        # For neg-risk markets, raw book always has bids/asks (at 0.001/0.999)
+        # so checking raw depth is useless. Instead check:
+        # 1. /price endpoint returned real values (not still the raw defaults)
+        # 2. Effective spread is reasonable (<50% = real market interest)
+        price_endpoint_worked = (
+            effective_bid != best_bid or effective_ask != best_ask
+        )
+        has_real_liquidity = (
+            price_endpoint_worked
+            and effective_spread < 0.50
+            and effective_bid > 0.001
+            and effective_ask < 0.999
+        )
 
         return {
             "bid_depth": bid_depth,
@@ -392,7 +413,7 @@ class MarketScanner:
             "best_bid": effective_bid,
             "best_ask": effective_ask,
             "spread": effective_spread,
-            "has_liquidity": bid_depth > 0 and ask_depth > 0,
+            "has_liquidity": has_real_liquidity,
         }
 
 

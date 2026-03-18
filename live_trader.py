@@ -14,6 +14,8 @@ Improvements:
 import os
 import json
 import time
+import logging
+import signal as sig
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field, asdict
@@ -22,6 +24,14 @@ import config
 from weather_engine import WeatherEngine
 from market_scanner import MarketScanner, WeatherMarket
 from edge_detector import EdgeDetector, TradingSignal
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("weather_bot")
 
 
 @dataclass
@@ -183,75 +193,117 @@ class LiveTrader:
     # ═══════════════════════════════════════════════════════════════
 
     def run_scan_cycle(self) -> List[TradingSignal]:
-        """Run one full scan cycle: discover markets, analyze, generate signals."""
+        """Run one full scan cycle: discover markets, analyze, generate signals.
 
-        # 1. Scan for active weather markets
-        print("\n[1/4] Scanning for weather markets...")
+        TWO-PHASE approach to minimize CLOB API calls:
+        Phase 1: Scan with Gamma prices (cheap) → find candidate edges
+        Phase 2: Enrich candidates with CLOB prices (expensive) → verify & execute
+        """
+
+        # ─── PHASE 1: Scan & screen with Gamma prices ───
+        logger.info("[1/5] Scanning for weather markets...")
         markets = self.scanner.scan_weather_markets()
-        print(f"  Found {len(markets)} active weather markets")
+        logger.info(f"  Found {len(markets)} active weather markets")
 
         if not markets:
-            print("  No weather markets found. Waiting...")
+            logger.info("  No weather markets found. Waiting...")
             return []
 
-        # 1b. CRITICAL: Replace stale Gamma API prices with live CLOB orderbook prices
-        print("\n[1b/4] Fetching live CLOB orderbook prices...")
-        markets = self.scanner.enrich_with_live_prices(markets)
-
-        all_signals = []
+        # Screen for candidate edges using Gamma prices (cheap, no CLOB calls)
+        logger.info("[2/5] Screening for candidate edges (Gamma prices)...")
+        candidate_markets = []
+        relaxed_threshold = max(0.02, config.MIN_EDGE_PCT - 0.02)  # Slightly relaxed
 
         for market in markets:
-            # 2. Get our weather prediction
             engine = self.engines.get(market.station_id)
             if not engine:
                 continue
 
-            print(f"\n[2/4] Analyzing: {market.question}")
-
-            # Fetch forecasts
             forecasts = engine.fetch_multi_model_forecasts(market.target_date)
             if not forecasts:
-                print("  No forecast data available")
                 continue
 
             ensemble_stats = engine.compute_ensemble_stats(forecasts)
-            print(f"  Ensemble: mean={ensemble_stats['mean']:.1f}°, "
-                  f"spread={ensemble_stats['spread']:.1f}°, "
-                  f"agreement={ensemble_stats['agreement']:.1%}")
-
-            # Generate probability distribution
             bucket_edges = self._market_to_bucket_edges(market)
             if not bucket_edges:
                 continue
 
             our_probs = engine.compute_probability_distribution(forecasts, bucket_edges)
 
-            # 3. Detect edges
-            print(f"[3/4] Detecting edges...")
-            current_exposure = sum(p.size_usd for p in self.positions)
+            # Try ML model (better predictions if model file available)
+            ml_probs = engine.compute_ml_probability_distribution(
+                forecasts, ensemble_stats, bucket_edges, market.target_date
+            )
+            if ml_probs:
+                our_probs = ml_probs
+
+            # Quick screen: any outcome with potential edge?
+            has_candidate = False
+            for outcome in market.outcomes:
+                our_prob = self.edge_detector._match_probability(outcome.name, our_probs)
+                if our_prob is None:
+                    continue
+                gamma_price = outcome.price
+                if gamma_price <= 0 or gamma_price >= 1:
+                    continue
+                edge = abs(our_prob - gamma_price)
+                if edge >= relaxed_threshold:
+                    has_candidate = True
+                    break
+
+            if has_candidate:
+                # Store forecast data for Phase 2
+                market._forecasts = forecasts
+                market._ensemble_stats = ensemble_stats
+                market._our_probs = our_probs
+                candidate_markets.append(market)
+
+        logger.info(f"  {len(candidate_markets)}/{len(markets)} markets have candidate edges")
+
+        if not candidate_markets:
+            logger.info("[5/5] No candidate edges found. Skipping CLOB enrichment.")
+            return []
+
+        # ─── PHASE 2: Enrich candidates with CLOB prices ───
+        logger.info(f"[3/5] Enriching {len(candidate_markets)} candidate markets with CLOB prices...")
+        candidate_markets = self.scanner.enrich_with_live_prices(candidate_markets)
+
+        # Re-run edge detection with real CLOB prices
+        logger.info("[4/5] Detecting edges with live CLOB prices...")
+        all_signals = []
+        current_exposure = sum(p.size_usd for p in self.positions)
+
+        for market in candidate_markets:
+            forecasts = market._forecasts
+            ensemble_stats = market._ensemble_stats
+            our_probs = market._our_probs
+
+            logger.info(f"  Analyzing: {market.question}")
+            logger.info(f"  Ensemble: mean={ensemble_stats['mean']:.1f} deg, "
+                  f"spread={ensemble_stats['spread']:.1f} deg, "
+                  f"agreement={ensemble_stats['agreement']:.1%}")
+
             signals = self.edge_detector.find_edges(
                 market, our_probs, ensemble_stats, self.bankroll, current_exposure
             )
 
             if signals:
-                print(f"  Found {len(signals)} trading signals:")
+                logger.info(f"  Found {len(signals)} trading signals:")
                 for s in signals[:5]:
-                    print(f"    {s.direction} '{s.outcome.name}' | "
+                    logger.info(f"    {s.direction} '{s.outcome.name}' | "
                           f"Edge: {s.edge:.1%} | "
                           f"Size: ${s.suggested_size_usd:.2f} | "
                           f"EV: ${s.expected_value:.4f}/$ | "
                           f"Conf: {s.confidence:.1%}")
-            else:
-                print("  No actionable edges found")
 
             all_signals.extend(signals)
 
-        # 4. Execute signals
+        # ─── PHASE 3: Execute ───
         if all_signals:
-            print(f"\n[4/4] Executing top signals...")
+            logger.info(f"[5/5] Executing top signals...")
             self._execute_signals(all_signals)
         else:
-            print(f"\n[4/4] No trades to execute")
+            logger.info("[5/5] No trades to execute")
 
         return all_signals
 
@@ -924,7 +976,18 @@ class LiveTrader:
 
     def run_continuous(self, duration_minutes: int = 60):
         """Run the bot continuously."""
-        print(f"\nStarting continuous mode for {duration_minutes} minutes...")
+        logger.info(f"Starting continuous mode for {duration_minutes} minutes...")
+
+        # Graceful shutdown handler
+        def handle_shutdown(signum, frame):
+            logger.info("Shutdown signal received, saving state...")
+            self._save_state()
+            self.print_pnl_report()
+            raise SystemExit(0)
+
+        sig.signal(sig.SIGTERM, handle_shutdown)
+        sig.signal(sig.SIGINT, handle_shutdown)
+
         end_time = datetime.now() + timedelta(minutes=duration_minutes)
 
         cycle = 0

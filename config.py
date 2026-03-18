@@ -249,11 +249,12 @@ MAX_POSITION_PCT = 0.10  # Max 10% per trade
 MAX_CONCURRENT_POSITIONS = 10  # Increased for 20-city coverage
 
 # Maximum total exposure (sum of all positions / bankroll)
-MAX_TOTAL_EXPOSURE = 0.50  # Max 50% (diversified across 20 cities)
+MAX_TOTAL_EXPOSURE = 0.75  # Max 75% (diversified across 20 cities, raised from 0.50)
 
 # Minimum trade size in USDC
-# Note: Polymarket orderMinSize is typically 5 shares, which at price 0.30 = $1.50
-MIN_TRADE_SIZE_USDC = 2.0
+# Polymarket requires ≥5 shares per order. At price 0.74, $5→6.8 shares (valid).
+# At price 0.40, $5→12.5 shares (valid). Must be ≥5 to avoid rejected orders.
+MIN_TRADE_SIZE_USDC = 5.0
 
 # Maximum trade size in USDC
 MAX_TRADE_SIZE_USDC = 15.0  # Conservative for $50 bankroll; increase proportionally
@@ -289,7 +290,7 @@ SIM_MARKET_NOISE = 0.015 # Market prices are fairly efficient
 # ═══════════════════════════════════════════════════════════════════
 # OPERATIONAL
 # ═══════════════════════════════════════════════════════════════════
-SCAN_INTERVAL_SECONDS = 300  # Check markets every 5 min
+SCAN_INTERVAL_SECONDS = 900  # Check markets every 15 min (was 5min, reduced to avoid CLOB rate limits)
 LOG_LEVEL = "INFO"
 PAPER_TRADING = True  # Start in paper mode
 DATA_DIR = "data"
@@ -317,7 +318,8 @@ CLIMATE_ZONES = {
 MAX_POSITIONS_PER_ZONE = 3
 
 # Slug-based market discovery: number of days ahead to scan
-MARKET_SCAN_DAYS_AHEAD = 7
+# 3 days ahead: better forecasts, more liquid markets, fewer API calls
+MARKET_SCAN_DAYS_AHEAD = 3
 
 # ═══════════════════════════════════════════════════════════════════
 # WEATHER UNDERGROUND (Resolution Data Source)
