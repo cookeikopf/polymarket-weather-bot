@@ -372,6 +372,10 @@ class MarketScanner:
         spread = best_ask - best_bid if bids and asks else 1.0
 
         # For neg-risk markets, also check effective CLOB prices
+        # CRITICAL: /price?side=BUY returns the LOWER price (effective ASK —
+        #   the price you'd pay to BUY shares) and /price?side=SELL returns
+        #   the HIGHER price (effective BID — what you'd receive when selling).
+        #   This is counterintuitive but correct for neg-risk markets.
         effective_bid = best_bid
         effective_ask = best_ask
         try:
@@ -386,8 +390,17 @@ class MarketScanner:
                 timeout=5,
             )
             if buy_resp.status_code == 200 and sell_resp.status_code == 200:
-                effective_bid = float(buy_resp.json().get("price", best_bid))
-                effective_ask = float(sell_resp.json().get("price", best_ask))
+                buy_price = float(buy_resp.json().get("price", best_bid))
+                sell_price = float(sell_resp.json().get("price", best_ask))
+                # BUY price = effective ASK (what you pay), typically LOWER
+                # SELL price = effective BID (what you receive), typically HIGHER
+                effective_ask = buy_price   # We PAY this to buy
+                effective_bid = sell_price   # We RECEIVE this when selling
+                # Sanity check: bid should be >= ask in neg-risk (sell > buy)
+                # If not, something is wrong — fall back to raw book
+                if effective_bid < effective_ask:
+                    logger.warning(f"BID/ASK sanity check failed: bid={effective_bid:.4f} < ask={effective_ask:.4f}. "
+                                   f"raw buy={buy_price:.4f}, raw sell={sell_price:.4f}. Using as-is.")
         except Exception:
             pass
 

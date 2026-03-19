@@ -247,6 +247,39 @@ class LiveTrader:
                 our_probs = ml_probs
                 logger.debug(f"  {market.station_id}/{market.target_date}: using ML probabilities")
 
+            # ── BUG FIX: Validate outcome label matching (phantom prevention) ──
+            # Build a validated probability dict that only includes entries
+            # whose keys can be matched against REAL market outcomes.
+            # This prevents phantom labels (e.g. our engine generating "63°F or below"
+            # when the actual market only has "59°F or below").
+            actual_outcome_names = {o.name for o in market.outcomes}
+            validated_probs = {}
+            phantom_labels = []
+            for label, prob in our_probs.items():
+                # Check: can ANY real market outcome match this label via _match_probability?
+                # We need to check both directions:
+                # 1) Does this label appear as a key that a market outcome can find?
+                found_match = False
+                for outcome in market.outcomes:
+                    result = self.edge_detector._match_probability(outcome.name, {label: prob})
+                    if result is not None:
+                        found_match = True
+                        break
+                if found_match:
+                    validated_probs[label] = prob
+                else:
+                    phantom_labels.append(label)
+            if phantom_labels:
+                logger.warning(f"  PHANTOM FILTER: Removed {len(phantom_labels)} phantom labels "
+                              f"for {market.station_id}/{market.target_date}: {phantom_labels}")
+                logger.debug(f"    Market outcome names: {list(actual_outcome_names)}")
+            # Renormalize to sum to 1
+            total_vp = sum(validated_probs.values())
+            if total_vp > 0:
+                validated_probs = {k: v / total_vp for k, v in validated_probs.items()}
+            our_probs = validated_probs
+            market._our_probs = our_probs
+
             # Quick screen: any outcome with potential edge?
             has_candidate = False
             best_edge_this_market = 0
@@ -427,6 +460,20 @@ class LiveTrader:
                 print("  Max concurrent positions reached")
                 break
 
+            # ── BUG FIX: Prevent duplicate positions on same outcome ──
+            # Check if we already hold a position on this market_slug + outcome_name + direction
+            already_held = any(
+                p.market_slug == signal.market.slug
+                and p.outcome_name == signal.outcome.name
+                and p.direction == signal.direction
+                and p.status == "open"
+                for p in self.positions
+            )
+            if already_held:
+                logger.info(f"  DEDUP: Skipping '{signal.outcome.name}' on {signal.market.slug} — "
+                            f"already have open {signal.direction} position")
+                continue
+
             # Check climate zone correlation limits
             if not self._check_zone_capacity(signal.market.station_id):
                 print(f"  Skipping {signal.market.station_id}: zone position limit reached")
@@ -475,15 +522,21 @@ class LiveTrader:
     def _paper_execute(self, signal: TradingSignal):
         """Execute a paper trade.
 
-        Uses signal.market_price which has been enriched with live CLOB prices
-        by enrich_with_live_prices() in the scan cycle.
-        For BUY_NO, entry_price = 1 - YES_price (the NO share cost).
+        Uses spread-aware CLOB prices for realistic paper execution:
+        - BUY_YES: entry at _clob_ask (what we'd actually pay for YES shares)
+        - BUY_NO: entry at 1 - _clob_bid (what we'd actually pay for NO shares)
+        Falls back to mid-price if CLOB data not available (backtesting).
         """
+        clob_ask = getattr(signal.outcome, '_clob_ask', None)
+        clob_bid = getattr(signal.outcome, '_clob_bid', None)
+
         if signal.direction == "BUY_YES":
-            entry_price = signal.market_price  # YES price from CLOB
+            # For BUY_YES: we pay the ask price
+            entry_price = clob_ask if clob_ask else signal.market_price
             token_id = signal.outcome.token_id
         else:
-            entry_price = 1.0 - signal.market_price  # NO price = 1 - YES CLOB price
+            # For BUY_NO: we pay 1 - bid price for the NO share
+            entry_price = (1.0 - clob_bid) if clob_bid else (1.0 - signal.market_price)
             token_id = signal.outcome.no_token_id or signal.outcome.token_id
 
         if entry_price <= 0 or entry_price >= 1:
