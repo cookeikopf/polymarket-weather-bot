@@ -449,7 +449,7 @@ class LiveTrader:
 
         executed = 0
         for signal in signals:
-            if executed >= 3:  # Max trades per cycle
+            if executed >= 20:  # Max trades per cycle — raised for paper data collection
                 break
 
             if signal.suggested_size_usd < config.MIN_TRADE_SIZE_USDC:

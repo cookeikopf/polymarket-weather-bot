@@ -225,31 +225,31 @@ TEMP_BUCKET_SIZE_F = 2
 # EDGE DETECTION & TRADING SIGNALS
 # ═══════════════════════════════════════════════════════════════════
 # Minimum edge (our prob - market prob) to enter a trade
-MIN_EDGE_PCT = 0.04  # 4% minimum edge (weather: 0 fees = lower threshold profitable)
+MIN_EDGE_PCT = 0.03  # 3% minimum edge — lowered for paper trading to capture more signals
 
 # Minimum absolute probability for a bucket to be tradeable
-MIN_PROBABILITY = 0.03  # Don't trade on < 3% outcomes
+MIN_PROBABILITY = 0.02  # 2% — lowered for paper trading data collection
 
 # Maximum price we'll pay for a share (avoid illiquid extremes)
 MAX_ENTRY_PRICE = 0.92
 
 # Confidence threshold (0-1) from ensemble agreement
-MIN_ENSEMBLE_AGREEMENT = 0.50  # 50% agreement (relaxed: 20 cities provide diversification)
+MIN_ENSEMBLE_AGREEMENT = 0.40  # 40% — lowered for paper trading to capture more signals
 
 # ═══════════════════════════════════════════════════════════════════
 # KELLY CRITERION & POSITION SIZING
 # ═══════════════════════════════════════════════════════════════════
 # Fractional Kelly (full Kelly is too aggressive)
-KELLY_FRACTION = 0.20  # Fifth Kelly — conservative, smoother equity curve
+KELLY_FRACTION = 0.20  # Fifth Kelly — still conservative, size controlled by MAX_TRADE_SIZE_USDC
 
 # Maximum position size as fraction of bankroll
-MAX_POSITION_PCT = 0.10  # Max 10% per trade
+MAX_POSITION_PCT = 0.02  # 2% per trade — small bets, many trades
 
 # Maximum number of concurrent positions
-MAX_CONCURRENT_POSITIONS = 10  # Increased for 20-city coverage
+MAX_CONCURRENT_POSITIONS = 100  # Paper trading: capture every signal across all markets
 
 # Maximum total exposure (sum of all positions / bankroll)
-MAX_TOTAL_EXPOSURE = 0.75  # Max 75% (diversified across 20 cities, raised from 0.50)
+MAX_TOTAL_EXPOSURE = 0.95  # Paper trading: 95% — almost no cap, maximize data
 
 # Minimum trade size in USDC
 # Polymarket requires ≥5 shares per order. At price 0.74, $5→6.8 shares (valid).
@@ -257,13 +257,13 @@ MAX_TOTAL_EXPOSURE = 0.75  # Max 75% (diversified across 20 cities, raised from 
 MIN_TRADE_SIZE_USDC = 5.0
 
 # Maximum trade size in USDC
-MAX_TRADE_SIZE_USDC = 15.0  # Conservative for $50 bankroll; increase proportionally
+MAX_TRADE_SIZE_USDC = 10.0  # $10 max bet — small positions, many trades for data collection
 
 # ═══════════════════════════════════════════════════════════════════
 # RISK MANAGEMENT
 # ═══════════════════════════════════════════════════════════════════
 # Stop trading if drawdown exceeds this
-MAX_DRAWDOWN_PCT = 0.15  # 15% max drawdown halt
+MAX_DRAWDOWN_PCT = 0.50  # 50% — paper trading: don't stop collecting data on drawdown
 
 # Take profit if edge narrows below this
 TAKE_PROFIT_EDGE_PCT = 0.02  # Exit if edge < 2%
@@ -280,7 +280,7 @@ TRAILING_STOP_PCT = 0.30  # 30% of peak unrealized profit
 BACKTEST_START_DATE = "2024-01-01"
 BACKTEST_END_DATE = "2026-03-15"
 BACKTEST_INITIAL_BANKROLL = 100.0  # Starting capital (adjustable via .env)
-LIVE_BANKROLL = float(os.getenv("POLYMARKET_BANKROLL", "100.0"))  # Live trading bankroll
+LIVE_BANKROLL = float(os.getenv("POLYMARKET_BANKROLL", "1000.0"))  # $1000 paper bankroll for max data collection
 
 # Simulated market parameters
 SIM_SPREAD = 0.06        # 6% bid-ask spread (realistic for weather markets)
@@ -315,11 +315,11 @@ CLIMATE_ZONES = {
     "South_Asia": ["Singapore", "Lucknow"],
     "Oceania": ["Wellington"],
 }
-MAX_POSITIONS_PER_ZONE = 3
+MAX_POSITIONS_PER_ZONE = 15  # Paper trading: no zone restrictions
 
 # Slug-based market discovery: number of days ahead to scan
 # 3 days ahead: better forecasts, more liquid markets, fewer API calls
-MARKET_SCAN_DAYS_AHEAD = 3
+MARKET_SCAN_DAYS_AHEAD = 5  # Scan 5 days ahead — more markets = more data
 
 # ═══════════════════════════════════════════════════════════════════
 # WEATHER UNDERGROUND (Resolution Data Source)
