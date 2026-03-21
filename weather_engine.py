@@ -50,7 +50,7 @@ class WeatherEngine:
     # In-memory forecast cache: {(station_id, target_date, variable): {model: value}}
     _forecast_cache: Dict[tuple, Dict[str, float]] = {}
     _forecast_cache_time: Dict[tuple, float] = {}  # cache timestamps
-    CACHE_TTL_SECONDS = 3600  # Refresh forecasts every hour
+    CACHE_TTL_SECONDS = 5400  # Refresh forecasts every 90 min (reduce API load)
 
     def fetch_multi_model_forecasts(
         self, target_date: str, variable: str = "temperature_2m_max"
@@ -69,6 +69,7 @@ class WeatherEngine:
 
         forecasts = {}
         failures = 0
+        backoff = 0.5  # Start with 0.5s between calls
 
         for model in config.WEATHER_MODELS:
             try:
@@ -84,27 +85,45 @@ class WeatherEngine:
                 if model != "best_match":
                     params["models"] = model
 
-                resp = requests.get(config.OPEN_METEO_FORECAST_URL, params=params, timeout=10)
+                resp = requests.get(config.OPEN_METEO_FORECAST_URL, params=params, timeout=15)
                 if resp.status_code == 200:
                     data = resp.json()
                     if "daily" in data and variable in data["daily"]:
                         values = data["daily"][variable]
                         if values and values[0] is not None:
                             forecasts[model] = float(values[0])
+                            backoff = 0.5  # Reset backoff on success
                         else:
                             failures += 1
                     else:
                         failures += 1
                 elif resp.status_code == 429:
-                    print(f"  WARNING: Open-Meteo rate limited (429) for {model}")
-                    failures += 1
-                    time.sleep(2)  # Back off on rate limit
+                    # Exponential backoff: 5s, 10s, 20s, 40s
+                    wait = min(backoff * 10, 60)
+                    print(f"  WARNING: Open-Meteo rate limited (429) for {model}, waiting {wait:.0f}s")
+                    time.sleep(wait)
+                    backoff = min(backoff * 2, 8)  # Increase backoff
+                    # Retry once after waiting
+                    resp = requests.get(config.OPEN_METEO_FORECAST_URL, params=params, timeout=15)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if "daily" in data and variable in data["daily"]:
+                            values = data["daily"][variable]
+                            if values and values[0] is not None:
+                                forecasts[model] = float(values[0])
+                            else:
+                                failures += 1
+                        else:
+                            failures += 1
+                    else:
+                        failures += 1
                 else:
                     failures += 1
-                time.sleep(0.2)  # Rate limiting
+                time.sleep(backoff)  # Pace API calls
             except Exception as e:
                 print(f"  Warning: Failed to fetch {model}: {e}")
                 failures += 1
+                time.sleep(backoff)
 
         if failures > 0 and len(forecasts) > 0:
             print(f"  Forecasts for {self.station_id}/{target_date}: {len(forecasts)} OK, {failures} failed")
@@ -139,7 +158,7 @@ class WeatherEngine:
                 if model != "best_match":
                     params["models"] = model
 
-                resp = requests.get(config.OPEN_METEO_FORECAST_URL, params=params, timeout=10)
+                resp = requests.get(config.OPEN_METEO_FORECAST_URL, params=params, timeout=15)
                 if resp.status_code == 200:
                     data = resp.json()
                     if "hourly" in data and "temperature_2m" in data["hourly"]:
@@ -147,9 +166,20 @@ class WeatherEngine:
                         valid_temps = [t for t in temps if t is not None]
                         if valid_temps:
                             hourly_forecasts[model] = valid_temps
-                time.sleep(0.2)
+                elif resp.status_code == 429:
+                    time.sleep(10)  # Rate limit backoff
+                    resp = requests.get(config.OPEN_METEO_FORECAST_URL, params=params, timeout=15)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if "hourly" in data and "temperature_2m" in data["hourly"]:
+                            temps = data["hourly"]["temperature_2m"]
+                            valid_temps = [t for t in temps if t is not None]
+                            if valid_temps:
+                                hourly_forecasts[model] = valid_temps
+                time.sleep(0.5)  # Pace API calls
             except Exception as e:
                 print(f"  Warning: Failed to fetch hourly {model}: {e}")
+                time.sleep(0.5)
 
         return hourly_forecasts
 
