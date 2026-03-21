@@ -1,14 +1,16 @@
 """
-Live Trading Module
-====================
+Live Trading Module (V3 — Production-Ready)
+=============================================
 Handles real order execution on Polymarket CLOB.
 Supports both paper trading (simulation) and live trading.
 
-Improvements:
-- Smart entry/exit with take-profit, edge decay, gradual position reduction
-- Orderbook liquidity checks before placing orders
-- Paper trading P&L tracking with disk persistence
-- Position correlation management across climate zones
+V3 CHANGES:
+- Daily loss limit tracking (stops trading after MAX_DAILY_LOSS_USDC)
+- Pre-trade safety checks (direction filter, entry price filter)
+- Conservative position sizing for real money
+- Tighter risk management (20% max drawdown, 3h time exit)
+- State reset on new day (daily P&L tracking)
+- Enhanced logging for every decision
 """
 
 import os
@@ -16,7 +18,7 @@ import json
 import time
 import logging
 import signal as sig
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field, asdict
 
@@ -87,19 +89,34 @@ class LiveTrader:
         self.trade_history: List[TradeRecord] = []
         self.peak_bankroll = self.bankroll
 
+        # ─── V3: Daily loss tracking ───
+        self.daily_pnl = 0.0
+        self.daily_trades = 0
+        self.trading_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self.daily_loss_halt = False
+
         # CLOB client (initialized on first live trade)
         self.clob_client = None
 
         # Load saved state if available
         self._load_state()
 
-        print(f"\n{'='*50}")
-        print(f"  Weather Prediction Bot")
-        print(f"  Mode: {'PAPER' if paper_mode else 'LIVE'}")
+        # Check if we need to reset daily tracking
+        self._check_daily_reset()
+
+        print(f"\n{'='*55}")
+        print(f"  Weather Prediction Bot V3")
+        print(f"  Mode: {'PAPER' if paper_mode else '*** LIVE ***'}")
         print(f"  Bankroll: ${self.bankroll:.2f}")
         print(f"  Open Positions: {len(self.positions)}")
         print(f"  Total Trades: {len(self.trade_history)}")
-        print(f"{'='*50}\n")
+        print(f"  Daily P&L: ${self.daily_pnl:+.2f}")
+        print(f"  Direction: {'BUY_YES+BUY_NO' if config.ALLOW_BUY_YES else 'BUY_NO ONLY'}")
+        print(f"  Min Entry Price: {config.MIN_ENTRY_PRICE}")
+        print(f"  Min Edge: {config.MIN_EDGE_PCT:.0%}")
+        print(f"  Max Daily Loss: ${config.MAX_DAILY_LOSS_USDC}")
+        print(f"  Max Drawdown: {config.MAX_DRAWDOWN_PCT:.0%}")
+        print(f"{'='*55}\n")
 
     def initialize(self):
         """Initialize engines and calibrate models."""
@@ -113,37 +130,23 @@ class LiveTrader:
             self._init_clob_client()
 
     def _init_clob_client(self):
-        """Initialize Polymarket CLOB client for live trading.
-
-        Authentication setup:
-        - Uses PRIVATE_KEY exported from Polymarket (reveal.polymarket.com)
-        - FUNDER_ADDRESS = your Polymarket proxy wallet (from profile URL)
-        - SIGNATURE_TYPE: 0=EOA, 1=POLY_PROXY (email login), 2=GNOSIS_SAFE (browser wallet)
-
-        Builder API (optional but recommended):
-        - Gasless transactions (no POL needed for gas)
-        - Order attribution → volume tracking → weekly USDC rewards
-        - Get keys at: polymarket.com/settings?tab=builder
-        """
+        """Initialize Polymarket CLOB client for live trading."""
         if not config.PRIVATE_KEY:
             raise ValueError("PRIVATE_KEY not set in .env file")
 
         try:
             from py_clob_client.client import ClobClient
 
-            # Build init kwargs
             init_kwargs = {
                 "host": config.POLYMARKET_HOST,
                 "key": config.PRIVATE_KEY,
                 "chain_id": config.CHAIN_ID,
             }
 
-            # Add funder/signature type if configured
             if config.FUNDER_ADDRESS:
                 init_kwargs["funder"] = config.FUNDER_ADDRESS
                 init_kwargs["signature_type"] = config.SIGNATURE_TYPE
 
-            # Add Builder API config if available (gasless + order attribution)
             builder_config = self._create_builder_config()
             if builder_config:
                 init_kwargs["builder_config"] = builder_config
@@ -151,7 +154,6 @@ class LiveTrader:
             else:
                 print("  Builder API: disabled (set POLY_BUILDER_API_KEY for gasless trading)")
 
-            # Create client and derive API creds
             temp_client = ClobClient(**init_kwargs)
             temp_client.set_api_creds(temp_client.create_or_derive_api_creds())
 
@@ -162,7 +164,7 @@ class LiveTrader:
 
         except Exception as e:
             print(f"  ERROR: Failed to initialize CLOB client: {e}")
-            print("  Falling back to paper trading mode")
+            print(f"  Falling back to paper trading mode")
             self.paper_mode = True
 
     def _create_builder_config(self):
@@ -189,6 +191,74 @@ class LiveTrader:
             return None
 
     # ═══════════════════════════════════════════════════════════════
+    # V3: DAILY LOSS TRACKING
+    # ═══════════════════════════════════════════════════════════════
+
+    def _check_daily_reset(self):
+        """Reset daily P&L tracking if it's a new trading day."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self.trading_day:
+            logger.info(f"  New trading day: {today} (was {self.trading_day})")
+            logger.info(f"  Yesterday's P&L: ${self.daily_pnl:+.2f} ({self.daily_trades} trades)")
+            self.daily_pnl = 0.0
+            self.daily_trades = 0
+            self.trading_day = today
+            self.daily_loss_halt = False
+            self._save_state()
+
+    def _check_daily_loss_limit(self) -> bool:
+        """Check if daily loss limit has been hit. Returns True if trading should stop."""
+        max_daily_loss = getattr(config, 'MAX_DAILY_LOSS_USDC', 20.0)
+        if self.daily_pnl <= -max_daily_loss:
+            if not self.daily_loss_halt:
+                logger.warning(f"  *** DAILY LOSS LIMIT HIT: ${self.daily_pnl:+.2f} "
+                             f"(limit: -${max_daily_loss:.2f}) — HALTING ALL TRADES ***")
+                self.daily_loss_halt = True
+                self._save_state()
+            return True
+        return False
+
+    def _record_trade_pnl(self, pnl: float):
+        """Record a trade's P&L for daily tracking."""
+        self.daily_pnl += pnl
+        self.daily_trades += 1
+
+    # ═══════════════════════════════════════════════════════════════
+    # V3: PRE-TRADE SAFETY CHECKS
+    # ═══════════════════════════════════════════════════════════════
+
+    def _pre_trade_checks(self) -> List[str]:
+        """Run all pre-trade safety checks. Returns list of blocking reasons (empty = OK)."""
+        issues = []
+
+        # 1. Daily loss limit
+        if self._check_daily_loss_limit():
+            issues.append(f"Daily loss limit hit: ${self.daily_pnl:+.2f}")
+
+        # 2. Max drawdown
+        if self.peak_bankroll > 0:
+            dd = (self.peak_bankroll - self.bankroll) / self.peak_bankroll
+            if dd > config.MAX_DRAWDOWN_PCT:
+                issues.append(f"Max drawdown exceeded: {dd:.1%} > {config.MAX_DRAWDOWN_PCT:.0%}")
+
+        # 3. Max concurrent positions
+        open_count = len([p for p in self.positions if p.status == "open"])
+        if open_count >= config.MAX_CONCURRENT_POSITIONS:
+            issues.append(f"Max positions reached: {open_count}/{config.MAX_CONCURRENT_POSITIONS}")
+
+        # 4. Total exposure
+        total_exposure = sum(p.size_usd for p in self.positions if p.status == "open")
+        max_exposure = self.bankroll * config.MAX_TOTAL_EXPOSURE
+        if total_exposure >= max_exposure:
+            issues.append(f"Max exposure reached: ${total_exposure:.2f} >= ${max_exposure:.2f}")
+
+        # 5. Bankroll sanity check (prevent trading with dust)
+        if self.bankroll < config.MIN_TRADE_SIZE_USDC * 2:
+            issues.append(f"Bankroll too low: ${self.bankroll:.2f}")
+
+        return issues
+
+    # ═══════════════════════════════════════════════════════════════
     # SCAN CYCLE
     # ═══════════════════════════════════════════════════════════════
 
@@ -199,6 +269,16 @@ class LiveTrader:
         Phase 1: Scan with Gamma prices (cheap) → find candidate edges
         Phase 2: Enrich candidates with CLOB prices (expensive) → verify & execute
         """
+
+        # ─── V3: Pre-trade safety checks ───
+        self._check_daily_reset()
+        blocking = self._pre_trade_checks()
+        if blocking:
+            for issue in blocking:
+                logger.warning(f"  SAFETY BLOCK: {issue}")
+            logger.info("  Skipping trade search due to safety blocks. Still checking exits...")
+            self.check_positions()
+            return []
 
         # ─── PHASE 1: Scan & screen with Gamma prices ───
         logger.info("[1/5] Scanning for weather markets...")
@@ -248,17 +328,10 @@ class LiveTrader:
                 logger.debug(f"  {market.station_id}/{market.target_date}: using ML probabilities")
 
             # ── BUG FIX: Validate outcome label matching (phantom prevention) ──
-            # Build a validated probability dict that only includes entries
-            # whose keys can be matched against REAL market outcomes.
-            # This prevents phantom labels (e.g. our engine generating "63°F or below"
-            # when the actual market only has "59°F or below").
             actual_outcome_names = {o.name for o in market.outcomes}
             validated_probs = {}
             phantom_labels = []
             for label, prob in our_probs.items():
-                # Check: can ANY real market outcome match this label via _match_probability?
-                # We need to check both directions:
-                # 1) Does this label appear as a key that a market outcome can find?
                 found_match = False
                 for outcome in market.outcomes:
                     result = self.edge_detector._match_probability(outcome.name, {label: prob})
@@ -361,35 +434,24 @@ class LiveTrader:
             logger.info(f"[5/5] Executing top signals...")
             self._execute_signals(all_signals)
         else:
-            logger.info("[5/5] No trades to execute")
+            logger.info("[5/5] No trades to execute (all filtered by V3 safety rules)")
 
         return all_signals
 
     def _market_to_bucket_edges(self, market: WeatherMarket) -> List[float]:
-        """Convert market outcomes to bucket edges.
-
-        Parses real Polymarket outcome names to extract the exact bucket boundaries.
-        - °F markets: "32-33°F" → edges at 32, 34; "31°F or below" → lower tail at 32
-        - °C markets: "14°C" → edges at 14, 15; "12°C or below" → lower tail at 13
-
-        Returns sorted list of edges where:
-        - Everything < edges[0] = lower tail ("X or below")
-        - edges[i] to edges[i+1] = regular bucket
-        - Everything >= edges[-1] = upper tail ("X or higher")
-        """
+        """Convert market outcomes to bucket edges."""
         import re
 
         station = config.STATIONS.get(market.station_id, {})
         is_fahrenheit = station.get("unit", "fahrenheit") == "fahrenheit"
 
-        range_lows = []   # lower bounds of regular range buckets
-        tail_low = None    # boundary of "X or below" tail
-        tail_high = None   # boundary of "X or higher" tail
+        range_lows = []
+        tail_low = None
+        tail_high = None
 
         for outcome in market.outcomes:
             name = outcome.name
 
-            # Check for tail labels first
             match_below = re.search(r'(-?\d+)\s*°?\s*[FC]?\s*or\s*below', name, re.IGNORECASE)
             match_higher = re.search(r'(-?\d+)\s*°?\s*[FC]?\s*or\s*higher', name, re.IGNORECASE)
 
@@ -400,19 +462,16 @@ class LiveTrader:
                 tail_high = int(match_higher.group(1))
                 continue
 
-            # °F range: "32-33°F" -> low bound is 32
             match = re.search(r'(-?\d+)\s*[-–]\s*(-?\d+)\s*°?\s*F', name)
             if match:
                 range_lows.append(int(match.group(1)))
                 continue
 
-            # °C single degree: "14°C" or "-5°C" -> that degree is the bucket
             match = re.search(r'(-?\d+)\s*°\s*C', name)
             if match:
                 range_lows.append(int(match.group(1)))
                 continue
 
-            # Fallback: extract first integer
             nums = re.findall(r'-?\d+', name)
             if nums:
                 range_lows.append(int(nums[0]))
@@ -423,18 +482,11 @@ class LiveTrader:
         range_lows.sort()
         step = 2 if is_fahrenheit else 1
 
-        # Build edges: each range_low starts a bucket of width `step`
-        # The edges array defines boundaries between buckets:
-        # [range_lows[0], range_lows[0]+step, range_lows[1]+step, ...]
-        # For °C: [13, 14, 15, 16, ...] (each bucket is 1°C)
-        # For °F: [32, 34, 36, 38, ...] (each bucket is 2°F)
         edges = []
         for low in range_lows:
             edges.append(low)
-        # Add the upper bound of the last range bucket
         edges.append(range_lows[-1] + step)
 
-        # Deduplicate and sort
         edges = sorted(set(edges))
         return edges
 
@@ -443,13 +495,27 @@ class LiveTrader:
     # ═══════════════════════════════════════════════════════════════
 
     def _execute_signals(self, signals: List[TradingSignal]):
-        """Execute trading signals (paper or live) with correlation checks."""
+        """Execute trading signals (paper or live) with all V3 safety checks."""
         # Sort by risk-adjusted EV
         signals.sort(key=lambda s: s.expected_value * s.confidence, reverse=True)
 
+        # ─── V3: Re-check safety before executing ───
+        blocking = self._pre_trade_checks()
+        if blocking:
+            for issue in blocking:
+                logger.warning(f"  EXECUTION BLOCKED: {issue}")
+            return
+
         executed = 0
+        max_trades_per_cycle = 5 if not self.paper_mode else 20  # V3: max 5 live trades per cycle
+
         for signal in signals:
-            if executed >= 20:  # Max trades per cycle — raised for paper data collection
+            if executed >= max_trades_per_cycle:
+                break
+
+            # Re-check daily loss each trade
+            if self._check_daily_loss_limit():
+                logger.warning("  Daily loss limit hit mid-cycle. Stopping execution.")
                 break
 
             if signal.suggested_size_usd < config.MIN_TRADE_SIZE_USDC:
@@ -457,11 +523,10 @@ class LiveTrader:
 
             # Check position limits
             if len(self.positions) >= config.MAX_CONCURRENT_POSITIONS:
-                print("  Max concurrent positions reached")
+                logger.info("  Max concurrent positions reached")
                 break
 
             # ── BUG FIX: Prevent duplicate positions on same outcome ──
-            # Check if we already hold a position on this market_slug + outcome_name + direction
             already_held = any(
                 p.market_slug == signal.market.slug
                 and p.outcome_name == signal.outcome.name
@@ -476,20 +541,22 @@ class LiveTrader:
 
             # Check climate zone correlation limits
             if not self._check_zone_capacity(signal.market.station_id):
-                print(f"  Skipping {signal.market.station_id}: zone position limit reached")
+                logger.info(f"  Skipping {signal.market.station_id}: zone position limit reached")
                 continue
 
-            # Check orderbook liquidity (for live markets)
-            if not self.paper_mode and signal.outcome.token_id and not signal.outcome.token_id.startswith("sim_"):
-                depth = self.scanner.fetch_orderbook_depth(signal.outcome.token_id)
-                if not depth["has_liquidity"]:
-                    print(f"  Skipping '{signal.outcome.name}': insufficient liquidity")
-                    continue
-                # Adjust size if liquidity is thin
-                available = depth["ask_depth"] if signal.direction == "BUY_YES" else depth["bid_depth"]
-                if available > 0 and signal.suggested_size_usd > available * 0.5:
-                    signal.suggested_size_usd = min(signal.suggested_size_usd, available * 0.5)
-                    print(f"  Reduced size to ${signal.suggested_size_usd:.2f} due to thin liquidity")
+            # ─── V3: LIVE ORDER EXECUTION WITH SAFETY ───
+            if not self.paper_mode:
+                # Check orderbook liquidity
+                if signal.outcome.token_id and not signal.outcome.token_id.startswith("sim_"):
+                    depth = self.scanner.fetch_orderbook_depth(signal.outcome.token_id)
+                    if not depth["has_liquidity"]:
+                        logger.info(f"  Skipping '{signal.outcome.name}': insufficient liquidity")
+                        continue
+                    # Adjust size if liquidity is thin
+                    available = depth["ask_depth"] if signal.direction == "BUY_YES" else depth["bid_depth"]
+                    if available > 0 and signal.suggested_size_usd > available * 0.5:
+                        signal.suggested_size_usd = min(signal.suggested_size_usd, available * 0.5)
+                        logger.info(f"  Reduced size to ${signal.suggested_size_usd:.2f} due to thin liquidity")
 
             if self.paper_mode:
                 self._paper_execute(signal)
@@ -498,12 +565,13 @@ class LiveTrader:
 
             executed += 1
 
+        logger.info(f"  Executed {executed} trades this cycle")
+
     def _check_zone_capacity(self, station_id: str) -> bool:
         """Check if we can open another position in the same climate zone."""
         max_per_zone = getattr(config, "MAX_POSITIONS_PER_ZONE", 3)
         zones = getattr(config, "CLIMATE_ZONES", {})
 
-        # Find which zone this station belongs to
         station_zone = None
         for zone_name, stations in zones.items():
             if station_id in stations:
@@ -511,36 +579,27 @@ class LiveTrader:
                 break
 
         if station_zone is None:
-            return True  # Unknown zone, allow
+            return True
 
-        # Count open positions in the same zone
         zone_stations = set(zones.get(station_zone, []))
-        zone_positions = sum(1 for p in self.positions if p.station_id in zone_stations)
+        zone_positions = sum(1 for p in self.positions if p.station_id in zone_stations and p.status == "open")
 
         return zone_positions < max_per_zone
 
     def _paper_execute(self, signal: TradingSignal):
-        """Execute a paper trade.
-
-        Uses spread-aware CLOB prices for realistic paper execution:
-        - BUY_YES: entry at _clob_ask (what we'd actually pay for YES shares)
-        - BUY_NO: entry at 1 - _clob_bid (what we'd actually pay for NO shares)
-        Falls back to mid-price if CLOB data not available (backtesting).
-        """
+        """Execute a paper trade with spread-aware CLOB prices."""
         clob_ask = getattr(signal.outcome, '_clob_ask', None)
         clob_bid = getattr(signal.outcome, '_clob_bid', None)
 
         if signal.direction == "BUY_YES":
-            # For BUY_YES: we pay the ask price
             entry_price = clob_ask if clob_ask else signal.market_price
             token_id = signal.outcome.token_id
         else:
-            # For BUY_NO: we pay 1 - bid price for the NO share
             entry_price = (1.0 - clob_bid) if clob_bid else (1.0 - signal.market_price)
             token_id = signal.outcome.no_token_id or signal.outcome.token_id
 
         if entry_price <= 0 or entry_price >= 1:
-            print(f"  [PAPER] Skipping '{signal.outcome.name}': invalid entry_price={entry_price:.3f}")
+            logger.info(f"  [PAPER] Skipping '{signal.outcome.name}': invalid entry_price={entry_price:.3f}")
             return
 
         shares = signal.suggested_size_usd / entry_price
@@ -555,7 +614,7 @@ class LiveTrader:
             size_usd=signal.suggested_size_usd,
             edge_at_entry=signal.edge,
             confidence=signal.confidence,
-            entry_time=datetime.now().isoformat(),
+            entry_time=datetime.now(timezone.utc).isoformat(),
             resolution_time=signal.market.end_date,
             station_id=signal.market.station_id,
             current_edge=signal.edge,
@@ -563,26 +622,15 @@ class LiveTrader:
         self.positions.append(position)
         self._save_state()
 
-        print(f"  [PAPER] {signal.direction} '{signal.outcome.name}' "
+        logger.info(f"  [PAPER] {signal.direction} '{signal.outcome.name}' "
               f"@ {entry_price:.3f} (YES={signal.market_price:.3f}) | "
               f"Size: ${signal.suggested_size_usd:.2f} | "
               f"Edge: {signal.edge:.1%}")
 
     def _live_execute(self, signal: TradingSignal):
-        """Execute a live trade on Polymarket CLOB.
-
-        Supports three order strategies:
-        - 'taker':    FOK/FAK market orders for instant fill
-        - 'maker':    Post-only limit orders (earns liquidity rewards)
-        - 'adaptive': Maker for small edges, taker for large edges (>15%)
-
-        Key details for neg-risk weather markets:
-        - Must pass PartialCreateOrderOptions(neg_risk=True, tick_size=...)
-        - BUY_YES: buy the YES token at market price
-        - BUY_NO: buy the NO token at (1 - market_price)
-        """
+        """Execute a live trade on Polymarket CLOB with V3 safety checks."""
         if not self.clob_client:
-            print("  ERROR: CLOB client not initialized")
+            logger.error("  ERROR: CLOB client not initialized")
             return
 
         try:
@@ -597,21 +645,19 @@ class LiveTrader:
                 # BUY_NO: buy the NO token directly
                 token_id = signal.outcome.no_token_id  # NO token
                 if not token_id:
-                    print(f"  ERROR: No NO token ID for '{signal.outcome.name}'")
+                    logger.error(f"  ERROR: No NO token ID for '{signal.outcome.name}'")
                     return
                 side = BUY
 
             # CRITICAL: Fetch LIVE orderbook price right before execution
-            # to prevent trading at stale/phantom prices
             live_depth = self.scanner.fetch_orderbook_depth(token_id)
             if not live_depth["has_liquidity"]:
-                print(f"  Skipping '{signal.outcome.name}': no liquidity in orderbook")
+                logger.info(f"  Skipping '{signal.outcome.name}': no liquidity in orderbook")
                 return
 
-            # Use best_ask for BUY orders (that's the price we'd actually pay)
             live_ask = live_depth["best_ask"]
             live_bid = live_depth["best_bid"]
-            base_price = live_ask  # We're buying, so we pay the ask
+            base_price = live_ask
 
             # Verify the live price hasn't diverged too far from signal price
             if signal.direction == "BUY_YES":
@@ -620,13 +666,13 @@ class LiveTrader:
                 expected_price = 1.0 - signal.market_price
 
             price_divergence = abs(base_price - expected_price)
-            if price_divergence > 0.10:  # >10 cent divergence = stale signal
-                print(f"  PRICE MISMATCH: '{signal.outcome.name}' "
+            if price_divergence > 0.05:  # V3: tighter tolerance (was 0.10)
+                logger.warning(f"  PRICE MISMATCH: '{signal.outcome.name}' "
                       f"signal={expected_price:.3f} vs orderbook={base_price:.3f} "
                       f"(divergence={price_divergence:.3f}). Skipping.")
                 return
-            elif price_divergence > 0.03:
-                print(f"  PRICE DRIFT: '{signal.outcome.name}' "
+            elif price_divergence > 0.02:
+                logger.info(f"  PRICE DRIFT: '{signal.outcome.name}' "
                       f"signal={expected_price:.3f} vs orderbook={base_price:.3f} "
                       f"(drift={price_divergence:.3f}). Proceeding with live price.")
 
@@ -641,12 +687,9 @@ class LiveTrader:
 
             # Adjust price based on strategy
             if strategy == "maker":
-                # Post-only: place slightly inside the spread to be first in queue
-                # but DON'T cross the spread (or the order gets rejected)
                 price = base_price - config.MAKER_PRICE_OFFSET
                 order_type_label = "MAKER (post-only)"
             else:
-                # Taker: match the current best price for instant fill
                 price = base_price
                 order_type_label = "TAKER (market)"
 
@@ -660,7 +703,7 @@ class LiveTrader:
             # Enforce minimum order size
             min_size = getattr(signal.market, 'order_min_size', 5.0)
             if size < min_size:
-                print(f"  Skipping: order size {size:.1f} shares < minimum {min_size}")
+                logger.info(f"  Skipping: order size {size:.1f} shares < minimum {min_size}")
                 return
 
             size = round(size, 2)
@@ -672,27 +715,24 @@ class LiveTrader:
                 token_id=token_id,
             )
 
-            # CRITICAL: pass neg_risk and tick_size for weather markets
             options = PartialCreateOrderOptions(
                 neg_risk=signal.market.neg_risk if signal.market.neg_risk else False,
                 tick_size=tick_size,
             )
 
-            print(f"  [LIVE] {order_type_label}: {signal.direction} '{signal.outcome.name}' "
+            logger.info(f"  [LIVE] {order_type_label}: {signal.direction} '{signal.outcome.name}' "
                   f"@ {price:.4f} x {size:.2f} shares (${signal.suggested_size_usd:.2f})")
-            print(f"         edge={signal.edge:.1%}, neg_risk={options.neg_risk}, tick={tick_size}")
+            logger.info(f"         edge={signal.edge:.1%}, neg_risk={options.neg_risk}, tick={tick_size}")
 
             # Execute based on strategy
             signed_order = self.clob_client.create_order(order_args, options)
 
             if strategy == "maker":
-                # Post-only: rejected if it would cross the spread (good - prevents bad fills)
                 resp = self.clob_client.post_order(signed_order, OrderType.GTC, post_only=True)
             else:
-                # Taker: GTC limit at market price (effectively a market order)
                 resp = self.clob_client.post_order(signed_order, OrderType.GTC)
 
-            print(f"  [LIVE] Response: {resp}")
+            logger.info(f"  [LIVE] Response: {resp}")
 
             if resp.get("success"):
                 position = Position(
@@ -705,21 +745,20 @@ class LiveTrader:
                     size_usd=signal.suggested_size_usd,
                     edge_at_entry=signal.edge,
                     confidence=signal.confidence,
-                    entry_time=datetime.now().isoformat(),
+                    entry_time=datetime.now(timezone.utc).isoformat(),
                     resolution_time=signal.market.end_date,
                     station_id=signal.market.station_id,
                     current_edge=signal.edge,
                 )
                 self.positions.append(position)
                 self._save_state()
-                print(f"  [LIVE] Position opened ({order_type_label})")
+                logger.info(f"  [LIVE] Position opened ({order_type_label})")
             else:
                 error_msg = resp.get("errorMsg", "Unknown error")
-                print(f"  [LIVE] Order rejected: {error_msg}")
+                logger.warning(f"  [LIVE] Order rejected: {error_msg}")
 
-                # If maker order rejected, fall back to taker
                 if strategy == "maker" and "post only" in str(error_msg).lower():
-                    print(f"  [LIVE] Maker rejected (would cross spread), retrying as taker...")
+                    logger.info(f"  [LIVE] Maker rejected (would cross spread), retrying as taker...")
                     resp = self.clob_client.post_order(signed_order, OrderType.GTC)
                     if resp.get("success"):
                         position = Position(
@@ -732,18 +771,18 @@ class LiveTrader:
                             size_usd=signal.suggested_size_usd,
                             edge_at_entry=signal.edge,
                             confidence=signal.confidence,
-                            entry_time=datetime.now().isoformat(),
+                            entry_time=datetime.now(timezone.utc).isoformat(),
                             resolution_time=signal.market.end_date,
                             station_id=signal.market.station_id,
                             current_edge=signal.edge,
                         )
                         self.positions.append(position)
                         self._save_state()
-                        print(f"  [LIVE] Position opened (fallback taker)")
+                        logger.info(f"  [LIVE] Position opened (fallback taker)")
 
         except Exception as e:
             import traceback
-            print(f"  ERROR: Live execution failed: {e}")
+            logger.error(f"  ERROR: Live execution failed: {e}")
             traceback.print_exc()
 
     # ═══════════════════════════════════════════════════════════════
@@ -753,16 +792,18 @@ class LiveTrader:
     def check_positions(self):
         """Check and manage existing positions with smart exit logic."""
         for pos in self.positions[:]:
+            if pos.status != "open":
+                continue
+
             try:
                 resolution_time = datetime.fromisoformat(pos.resolution_time.replace("Z", "+00:00"))
             except (ValueError, AttributeError):
-                # Can't parse resolution time, use a default far future
-                resolution_time = datetime.now() + timedelta(days=7)
-                if resolution_time.tzinfo is None:
-                    from datetime import timezone
-                    resolution_time = resolution_time.replace(tzinfo=timezone.utc)
+                resolution_time = datetime.now(timezone.utc) + timedelta(days=7)
 
-            now = datetime.now(resolution_time.tzinfo) if resolution_time.tzinfo else datetime.now()
+            if resolution_time.tzinfo is None:
+                resolution_time = resolution_time.replace(tzinfo=timezone.utc)
+
+            now = datetime.now(timezone.utc)
             hours_to_resolution = (resolution_time - now).total_seconds() / 3600
 
             # --- Take Profit: if market price matches our probability (edge -> 0) ---
@@ -775,24 +816,20 @@ class LiveTrader:
                 self._exit_position(pos, "edge_decay")
                 continue
 
-            # --- Smart Time-Based Exit ---
-            # Gradual position reduction instead of hard 2h cutoff
+            # --- Smart Time-Based Exit (V3: 3h hard exit, 6h partial) ---
+            exit_hours = getattr(config, 'EXIT_HOURS_BEFORE_RESOLUTION', 3)
             if hours_to_resolution < 6:
-                if hours_to_resolution < 2:
-                    # Hard exit: close position near resolution
-                    # Don't try to estimate P&L for ride-to-resolution decision —
-                    # just close all positions within 2h of resolution
+                if hours_to_resolution < exit_hours:
                     logger.info(f"  Exiting {pos.outcome_name} - {hours_to_resolution:.1f}h to resolution")
                     self._exit_position(pos, "time_exit")
                 elif hours_to_resolution < 6:
-                    # Reduce 50% of position at 6h mark
                     if pos.shares > 0 and not hasattr(pos, '_reduced'):
                         logger.info(f"  Reducing {pos.outcome_name} by 50% - {hours_to_resolution:.1f}h to resolution")
                         self._reduce_position(pos, 0.5)
 
     def _check_take_profit(self, pos: Position) -> bool:
         """Check if market price has moved to match our probability (edge -> 0)."""
-        take_profit_threshold = getattr(config, "TAKE_PROFIT_EDGE_PCT", 0.02)
+        take_profit_threshold = getattr(config, "TAKE_PROFIT_EDGE_PCT", 0.03)
         if abs(pos.current_edge) < take_profit_threshold and pos.current_edge < pos.edge_at_entry * 0.3:
             return True
         return False
@@ -804,7 +841,6 @@ class LiveTrader:
             return False
 
         try:
-            # Extract target_date from slug
             target_date = self._slug_to_target_date(pos.market_slug)
             if not target_date:
                 return False
@@ -813,14 +849,6 @@ class LiveTrader:
             if not forecasts:
                 return False
 
-            # Recompute our probability for this bucket
-            station = config.STATIONS.get(pos.station_id, {})
-            is_fahrenheit = station.get("unit", "fahrenheit") == "fahrenheit"
-            ensemble_mean = sum(forecasts.values()) / len(forecasts)
-
-            # Simple edge decay check: if forecast moved significantly away from entry assumption
-            # More sophisticated: recompute full probability distribution
-            # For now, flag if edge might have reversed
             if pos.edge_at_entry > 0.10 and abs(pos.current_edge) < 0.02:
                 return True
         except Exception:
@@ -829,60 +857,39 @@ class LiveTrader:
         return False
 
     def _estimate_unrealized_pnl(self, pos: Position) -> float:
-        """Estimate unrealized P&L by fetching LIVE market price from CLOB.
-
-        For paper trading, we MUST check the real current market price,
-        not estimate from entry edge (which always returns positive = fake profits).
-
-        P&L calculation:
-        - BUY_YES: bought at entry_price, current value = current_price
-          P&L = shares * (current_price - entry_price)
-        - BUY_NO: bought NO at entry_price, current NO value = 1 - current_YES_price
-          P&L = shares * ((1 - current_YES_price) - entry_price)
-        """
-        # Try to get live price from CLOB
+        """Estimate unrealized P&L by fetching LIVE market price from CLOB."""
         try:
             if pos.token_id and not pos.token_id.startswith("sim_"):
                 depth = self.scanner.fetch_orderbook_depth(pos.token_id)
                 if depth["has_liquidity"]:
                     current_mid = (depth["best_bid"] + depth["best_ask"]) / 2.0
                     if pos.direction == "BUY_YES":
-                        # YES share value is the current YES price
                         return pos.shares * (current_mid - pos.entry_price)
                     else:
-                        # NO share value = 1 - YES price
                         current_no_price = 1.0 - current_mid
                         return pos.shares * (current_no_price - pos.entry_price)
         except Exception:
             pass
 
-        # Fallback: can't get live price, return 0 (unknown)
         return 0.0
 
     def _reduce_position(self, pos: Position, fraction: float):
-        """Reduce a position by a fraction (e.g., 0.5 = close half).
-
-        Fetches the REAL current market price from CLOB to compute actual P&L.
-        """
+        """Reduce a position by a fraction. Fetches REAL exit price from CLOB."""
         exit_shares = pos.shares * fraction
         exit_size = pos.size_usd * fraction
 
-        # Fetch REAL exit price from CLOB
         exit_price = pos.entry_price  # fallback
         try:
             if pos.token_id and not pos.token_id.startswith("sim_"):
                 depth = self.scanner.fetch_orderbook_depth(pos.token_id)
                 if depth["has_liquidity"]:
                     if pos.direction == "BUY_YES":
-                        # Selling YES shares: we receive the bid price
                         exit_price = depth["best_bid"]
                     else:
-                        # Selling NO shares: NO value = 1 - YES ask
                         exit_price = 1.0 - depth["best_ask"]
         except Exception:
             pass
 
-        # Calculate real P&L
         pnl = exit_shares * (exit_price - pos.entry_price)
 
         self.trade_history.append(TradeRecord(
@@ -897,11 +904,13 @@ class LiveTrader:
             pnl=pnl,
             edge_at_entry=pos.edge_at_entry,
             entry_time=pos.entry_time,
-            exit_time=datetime.now().isoformat(),
+            exit_time=datetime.now(timezone.utc).isoformat(),
             exit_reason="partial_time_exit",
         ))
 
-        # Reduce position
+        # V3: Track daily P&L
+        self._record_trade_pnl(pnl)
+
         pos.shares -= exit_shares
         pos.size_usd -= exit_size
         self.bankroll += exit_size + pnl
@@ -912,21 +921,16 @@ class LiveTrader:
         self._save_state()
 
     def _exit_position(self, position: Position, reason: str = "time_exit"):
-        """Exit a position (paper or live) and record trade.
-
-        Fetches the REAL current market price from CLOB to compute actual P&L.
-        For resolved markets (no liquidity), P&L = 0 (conservative fallback).
-        """
-        # Fetch REAL exit price from CLOB
+        """Exit a position and record trade. Fetches REAL exit price from CLOB."""
         exit_price = position.entry_price  # fallback = breakeven
         try:
             if position.token_id and not position.token_id.startswith("sim_"):
                 depth = self.scanner.fetch_orderbook_depth(position.token_id)
                 if depth["has_liquidity"]:
                     if position.direction == "BUY_YES":
-                        exit_price = depth["best_bid"]  # sell YES at bid
+                        exit_price = depth["best_bid"]
                     else:
-                        exit_price = 1.0 - depth["best_ask"]  # sell NO = 1 - YES ask
+                        exit_price = 1.0 - depth["best_ask"]
         except Exception:
             pass
 
@@ -944,10 +948,14 @@ class LiveTrader:
             pnl=pnl,
             edge_at_entry=position.edge_at_entry,
             entry_time=position.entry_time,
-            exit_time=datetime.now().isoformat(),
+            exit_time=datetime.now(timezone.utc).isoformat(),
             exit_reason=reason,
         )
         self.trade_history.append(record)
+
+        # V3: Track daily P&L
+        self._record_trade_pnl(pnl)
+
         self.bankroll += position.size_usd + pnl
         self.peak_bankroll = max(self.peak_bankroll, self.bankroll)
 
@@ -983,30 +991,50 @@ class LiveTrader:
         """Save positions and trade history to disk."""
         os.makedirs(config.RESULTS_DIR, exist_ok=True)
         state = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "version": "V3",
+            "mode": "PAPER" if self.paper_mode else "LIVE",
             "bankroll": self.bankroll,
             "peak_bankroll": self.peak_bankroll,
+            "daily_pnl": self.daily_pnl,
+            "daily_trades": self.daily_trades,
+            "trading_day": self.trading_day,
+            "daily_loss_halt": self.daily_loss_halt,
             "positions": [asdict(p) for p in self.positions],
             "trade_history": [asdict(t) for t in self.trade_history],
         }
         try:
-            with open(f"{config.RESULTS_DIR}/paper_trading_state.json", "w") as f:
+            state_file = f"{config.RESULTS_DIR}/{'paper' if self.paper_mode else 'live'}_trading_state.json"
+            with open(state_file, "w") as f:
                 json.dump(state, f, indent=2, default=str)
         except Exception as e:
-            print(f"  Warning: Failed to save state: {e}")
+            logger.error(f"  Warning: Failed to save state: {e}")
 
     def _load_state(self):
         """Load positions and trade history from disk."""
-        state_path = f"{config.RESULTS_DIR}/paper_trading_state.json"
+        # Try live state first, then paper state
+        state_path = f"{config.RESULTS_DIR}/{'paper' if self.paper_mode else 'live'}_trading_state.json"
         if not os.path.exists(state_path):
-            return
+            # Also check the old filename
+            state_path = f"{config.RESULTS_DIR}/paper_trading_state.json"
+            if not os.path.exists(state_path):
+                return
 
         try:
             with open(state_path, "r") as f:
                 state = json.load(f)
 
-            self.bankroll = state.get("bankroll", self.bankroll)
-            self.peak_bankroll = state.get("peak_bankroll", self.peak_bankroll)
+            # Only load bankroll from live state if matching mode
+            state_mode = state.get("mode", "PAPER")
+            if (state_mode == "LIVE") == (not self.paper_mode):
+                self.bankroll = state.get("bankroll", self.bankroll)
+                self.peak_bankroll = state.get("peak_bankroll", self.peak_bankroll)
+
+            # V3: Load daily tracking
+            self.daily_pnl = state.get("daily_pnl", 0.0)
+            self.daily_trades = state.get("daily_trades", 0)
+            self.trading_day = state.get("trading_day", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+            self.daily_loss_halt = state.get("daily_loss_halt", False)
 
             self.positions = []
             for p in state.get("positions", []):
@@ -1022,10 +1050,10 @@ class LiveTrader:
                     if k in TradeRecord.__dataclass_fields__
                 }))
 
-            print(f"  Loaded state: ${self.bankroll:.2f} bankroll, "
+            logger.info(f"  Loaded state: ${self.bankroll:.2f} bankroll, "
                   f"{len(self.positions)} positions, {len(self.trade_history)} trades")
         except Exception as e:
-            print(f"  Warning: Failed to load state: {e}")
+            logger.error(f"  Warning: Failed to load state: {e}")
 
     def compute_pnl_report(self) -> Dict:
         """Compute running P&L and generate status report."""
@@ -1053,7 +1081,8 @@ class LiveTrader:
                 station_pnl[t.station_id]["wins"] += 1
 
         report = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "version": "V3",
             "mode": "PAPER" if self.paper_mode else "LIVE",
             "bankroll": self.bankroll,
             "peak_bankroll": self.peak_bankroll,
@@ -1067,6 +1096,9 @@ class LiveTrader:
             "avg_win": avg_win,
             "avg_loss": avg_loss,
             "profit_factor": profit_factor,
+            "daily_pnl": self.daily_pnl,
+            "daily_trades": self.daily_trades,
+            "daily_loss_halt": self.daily_loss_halt,
             "station_breakdown": station_pnl,
         }
 
@@ -1077,7 +1109,7 @@ class LiveTrader:
         report = self.compute_pnl_report()
 
         print(f"\n{'='*55}")
-        print(f"  P&L Report ({report['mode']} Mode)")
+        print(f"  P&L Report V3 ({report['mode']} Mode)")
         print(f"{'='*55}")
         print(f"  Bankroll:          ${report['bankroll']:.2f}")
         print(f"  Peak Bankroll:     ${report['peak_bankroll']:.2f}")
@@ -1091,6 +1123,10 @@ class LiveTrader:
         print(f"  Avg Win:           ${report['avg_win']:+.2f}")
         print(f"  Avg Loss:          ${report['avg_loss']:+.2f}")
         print(f"  Profit Factor:     {report['profit_factor']:.2f}")
+        print(f"  ─── Daily ───")
+        print(f"  Daily P&L:         ${report['daily_pnl']:+.2f}")
+        print(f"  Daily Trades:      {report['daily_trades']}")
+        print(f"  Daily Halt:        {'YES' if report['daily_loss_halt'] else 'No'}")
 
         if report['station_breakdown']:
             print(f"\n  Station Breakdown:")
@@ -1131,20 +1167,23 @@ class LiveTrader:
             print(f"\n{'─'*40}")
             print(f"  Cycle {cycle} | {datetime.now().strftime('%H:%M:%S')}")
             print(f"  Bankroll: ${self.bankroll:.2f} | Positions: {len(self.positions)}")
+            print(f"  Daily P&L: ${self.daily_pnl:+.2f} | Halt: {'YES' if self.daily_loss_halt else 'No'}")
             print(f"{'─'*40}")
 
             # Check drawdown halt
             if self.peak_bankroll > 0:
                 dd = (self.peak_bankroll - self.bankroll) / self.peak_bankroll
                 if dd > config.MAX_DRAWDOWN_PCT:
-                    print(f"  DRAWDOWN HALT: {dd:.1%} exceeds {config.MAX_DRAWDOWN_PCT:.0%} limit")
+                    logger.warning(f"  DRAWDOWN HALT: {dd:.1%} exceeds {config.MAX_DRAWDOWN_PCT:.0%} limit")
                     break
 
             try:
                 self.run_scan_cycle()
                 self.check_positions()
             except Exception as e:
-                print(f"  Error in cycle: {e}")
+                logger.error(f"  Error in cycle: {e}")
+                import traceback
+                traceback.print_exc()
 
             # Print report every 5 cycles
             if cycle % 5 == 0:
@@ -1163,10 +1202,16 @@ class LiveTrader:
     def get_status(self) -> Dict:
         """Get current bot status."""
         return {
+            "version": "V3",
             "mode": "PAPER" if self.paper_mode else "LIVE",
             "bankroll": self.bankroll,
             "positions": len(self.positions),
             "total_trades": len(self.trade_history),
             "peak_bankroll": self.peak_bankroll,
             "current_drawdown": (self.peak_bankroll - self.bankroll) / self.peak_bankroll * 100 if self.peak_bankroll > 0 else 0,
+            "daily_pnl": self.daily_pnl,
+            "daily_loss_halt": self.daily_loss_halt,
+            "strategy": "BUY_NO_ONLY" if not config.ALLOW_BUY_YES else "BUY_YES+BUY_NO",
+            "min_edge": config.MIN_EDGE_PCT,
+            "min_entry_price": config.MIN_ENTRY_PRICE,
         }

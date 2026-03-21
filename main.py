@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-Polymarket Weather Prediction Bot - Main Entry Point
-=====================================================
+Polymarket Weather Prediction Bot V3 - Main Entry Point
+=========================================================
 
-REVOLUTIONARY APPROACH:
-1. Multi-model ensemble from 8+ global NWP models (ECMWF, GFS, ICON, etc.)
-2. Bayesian probability calibration using historical forecast errors
-3. Monte Carlo simulation for probability distribution estimation
-4. Kelly Criterion position sizing with fractional Kelly for safety
-5. Edge detection: our probabilities vs. market consensus
+V3: Live-trading-ready with data-driven strategy from paper trading analysis.
+
+Strategy: BUY_NO only, min entry 0.55, min edge 10%, daily loss limit $20.
 
 Usage:
     python main.py backtest          Run full backtest
@@ -36,7 +33,6 @@ def cmd_backtest():
     result = bt.run_backtest(verbose=True)
     bt.print_results(result)
 
-    # Save results
     os.makedirs(config.RESULTS_DIR, exist_ok=True)
     results_data = {
         "timestamp": datetime.now().isoformat(),
@@ -49,7 +45,7 @@ def cmd_backtest():
         "profit_factor": result.profit_factor,
         "sharpe_ratio": result.sharpe_ratio,
         "calmar_ratio": result.calmar_ratio,
-        "equity_curve": result.equity_curve[-20:],  # Last 20 points
+        "equity_curve": result.equity_curve[-20:],
     }
     with open(f"{config.RESULTS_DIR}/backtest_latest.json", "w") as f:
         json.dump(results_data, f, indent=2)
@@ -65,7 +61,6 @@ def cmd_optimize():
     opt = ParameterOptimizer("NYC")
     results = opt.run_profile_optimization(verbose=True)
 
-    # Save optimization results
     os.makedirs(config.RESULTS_DIR, exist_ok=True)
     opt_data = {}
     for name, res in results.items():
@@ -111,7 +106,7 @@ def cmd_paper(duration: int = 60):
 
 
 def cmd_live(duration: int = 60):
-    """Run live trading."""
+    """Run live trading with V3 strategy."""
     from live_trader import LiveTrader
 
     if not config.PRIVATE_KEY:
@@ -127,16 +122,21 @@ def cmd_live(duration: int = 60):
         print("  Find it at: polymarket.com/profile/<YOUR_ADDRESS>")
         print("  Continuing in EOA mode...\n")
 
-    print("\n" + "=" * 55)
-    print("  ⚠️  LIVE TRADING MODE — Real money at risk!")
-    print("=" * 55)
-    print(f"  Duration:     {duration} minutes")
-    print(f"  Bankroll:     ${config.LIVE_BANKROLL:.2f}")
-    print(f"  Max per trade: ${config.MAX_TRADE_SIZE_USDC:.2f}")
-    print(f"  Max exposure:  {config.MAX_TOTAL_EXPOSURE:.0%} = ${config.LIVE_BANKROLL * config.MAX_TOTAL_EXPOSURE:.2f}")
-    print(f"  Max drawdown:  {config.MAX_DRAWDOWN_PCT:.0%} = ${config.LIVE_BANKROLL * config.MAX_DRAWDOWN_PCT:.2f}")
-    print(f"  Funder:        {config.FUNDER_ADDRESS[:10] + '...' if config.FUNDER_ADDRESS else 'EOA'}")
-    print("=" * 55)
+    print("\n" + "=" * 60)
+    print("  LIVE TRADING MODE V3 — Real money at risk!")
+    print("=" * 60)
+    print(f"  Duration:       {duration} minutes")
+    print(f"  Bankroll:       ${config.LIVE_BANKROLL:.2f}")
+    print(f"  Strategy:       {'BUY_YES+BUY_NO' if config.ALLOW_BUY_YES else 'BUY_NO ONLY'}")
+    print(f"  Min Edge:       {config.MIN_EDGE_PCT:.0%}")
+    print(f"  Min Entry:      {config.MIN_ENTRY_PRICE}")
+    print(f"  Max per trade:  ${config.MAX_TRADE_SIZE_USDC:.2f}")
+    print(f"  Max positions:  {config.MAX_CONCURRENT_POSITIONS}")
+    print(f"  Max exposure:   {config.MAX_TOTAL_EXPOSURE:.0%} = ${config.LIVE_BANKROLL * config.MAX_TOTAL_EXPOSURE:.2f}")
+    print(f"  Max drawdown:   {config.MAX_DRAWDOWN_PCT:.0%} = ${config.LIVE_BANKROLL * config.MAX_DRAWDOWN_PCT:.2f}")
+    print(f"  Daily loss cap: ${config.MAX_DAILY_LOSS_USDC:.2f}")
+    print(f"  Funder:         {config.FUNDER_ADDRESS[:10] + '...' if config.FUNDER_ADDRESS else 'EOA'}")
+    print("=" * 60)
     confirm = input("  Type 'YES' to confirm: ")
     if confirm != "YES":
         print("Aborted.")
@@ -164,23 +164,29 @@ def cmd_calibrate():
 
 def cmd_status():
     """Show bot configuration and status."""
-    print(f"\n{'='*50}")
-    print(f"  Polymarket Weather Bot - Configuration")
-    print(f"{'='*50}")
+    print(f"\n{'='*55}")
+    print(f"  Polymarket Weather Bot V3 - Configuration")
+    print(f"{'='*55}")
     print(f"  Paper Mode:           {config.PAPER_TRADING}")
+    print(f"  Strategy:             {'BUY_YES+BUY_NO' if config.ALLOW_BUY_YES else 'BUY_NO ONLY'}")
     print(f"  Stations:             {list(config.STATIONS.keys())}")
     print(f"  Weather Models:       {len(config.WEATHER_MODELS)}")
     print(f"  Min Edge:             {config.MIN_EDGE_PCT:.0%}")
+    print(f"  Min Entry Price:      {config.MIN_ENTRY_PRICE}")
+    print(f"  Max Entry Price:      {config.MAX_ENTRY_PRICE}")
     print(f"  Kelly Fraction:       {config.KELLY_FRACTION}")
     print(f"  Max Position:         {config.MAX_POSITION_PCT:.0%}")
+    print(f"  Max Concurrent:       {config.MAX_CONCURRENT_POSITIONS}")
     print(f"  Max Drawdown:         {config.MAX_DRAWDOWN_PCT:.0%}")
+    print(f"  Daily Loss Limit:     ${config.MAX_DAILY_LOSS_USDC}")
     print(f"  Scan Interval:        {config.SCAN_INTERVAL_SECONDS}s")
     print(f"  Live Bankroll:        ${config.LIVE_BANKROLL}")
     print(f"  Max Trade Size:       ${config.MAX_TRADE_SIZE_USDC}")
+    print(f"  Scan Days Ahead:      {config.MARKET_SCAN_DAYS_AHEAD}")
     print(f"  Private Key Set:      {'Yes' if config.PRIVATE_KEY else 'No'}")
     print(f"  Funder Address Set:   {'Yes' if config.FUNDER_ADDRESS else 'No'}")
     print(f"  Signature Type:       {config.SIGNATURE_TYPE}")
-    print(f"{'='*50}\n")
+    print(f"{'='*55}\n")
 
 
 def main():

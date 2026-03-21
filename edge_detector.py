@@ -1,14 +1,15 @@
 """
-Edge Detection & Signal Generation
-====================================
+Edge Detection & Signal Generation (V3 — Live Trading)
+========================================================
 Compares our ML probability distributions against market prices
 to find profitable trading opportunities.
 
-KEY INNOVATION: Bayesian edge estimation that combines:
-1. Our ensemble weather forecast probabilities
-2. Climatological base rates (prior)
-3. Market consensus (informative signal)
-4. Edge confidence intervals via bootstrap
+V3 CHANGES (based on retro-analysis of 20 paper positions):
+- Direction filter: BUY_YES disabled (0% win rate), BUY_NO only (58%)
+- Entry price filter: min 0.55, max 0.85
+- Edge threshold: 10% minimum (was 3%)
+- Ensemble agreement: 50% minimum (was 40%)
+- Forecast bias correction: conservative shift toward market consensus
 """
 
 import numpy as np
@@ -42,7 +43,10 @@ class EdgeDetector:
     def __init__(self):
         self.min_edge = config.MIN_EDGE_PCT
         self.min_probability = config.MIN_PROBABILITY
-        self.max_entry_price = config.MAX_ENTRY_PRICE
+        self.max_entry_price = getattr(config, 'MAX_ENTRY_PRICE', 0.85)
+        self.min_entry_price = getattr(config, 'MIN_ENTRY_PRICE', 0.55)
+        self.allow_buy_yes = getattr(config, 'ALLOW_BUY_YES', False)
+        self.allow_buy_no = getattr(config, 'ALLOW_BUY_NO', True)
 
     def find_edges(
         self,
@@ -72,7 +76,7 @@ class EdgeDetector:
                 continue
 
             # Skip extreme prices (illiquid, near-certain)
-            if market_price < 0.01 or market_price > self.max_entry_price:
+            if market_price < 0.01 or market_price > 0.99:
                 continue
 
             # Use spread-aware prices if CLOB data available
@@ -81,39 +85,60 @@ class EdgeDetector:
             clob_ask = getattr(outcome, '_clob_ask', None)
             clob_bid = getattr(outcome, '_clob_bid', None)
 
+            # ─── V3: FORECAST BIAS CORRECTION ───
+            # Retro-analysis showed our forecasts systematically overestimate
+            # extreme/tail probabilities. Apply conservative shrinkage toward
+            # the market consensus (Bayesian shrinkage).
+            # Blend: 70% our forecast + 30% market price
+            bias_corrected_prob = 0.70 * our_prob + 0.30 * market_price
+
             # Calculate edge accounting for spread
-            # BUY_YES: we pay the ask price, so edge = our_prob - ask
-            # BUY_NO: we pay 1 - bid for NO, so edge = (1-our_prob) vs (1-bid) → edge from YES perspective
             if clob_ask and clob_bid:
                 # Spread-aware edge: use worst-case execution price
                 buy_yes_cost = clob_ask   # What we actually pay for YES
                 buy_no_cost = 1.0 - clob_bid  # What we actually pay for NO
-                edge_yes = our_prob - buy_yes_cost
-                edge_no = (1.0 - our_prob) - buy_no_cost  # = clob_bid - our_prob
+                edge_yes = bias_corrected_prob - buy_yes_cost
+                edge_no = (1.0 - bias_corrected_prob) - buy_no_cost
             else:
                 # Fallback: mid-price (backtesting)
-                edge_yes = our_prob - market_price
-                edge_no = market_price - our_prob  # = (1-our_prob) - (1-market_price)
+                edge_yes = bias_corrected_prob - market_price
+                edge_no = market_price - bias_corrected_prob
 
-            edge_pct = abs(our_prob - market_price) / max(market_price, 0.01)
+            edge_pct = abs(bias_corrected_prob - market_price) / max(market_price, 0.01)
 
             # Determine direction based on which side has positive edge
             if edge_yes > edge_no and edge_yes > 0:
                 # BUY YES
                 direction = "BUY_YES"
                 entry_price = clob_ask if clob_ask else market_price
-                win_prob = our_prob
+                win_prob = bias_corrected_prob
                 payout = 1.0 - entry_price
                 edge = edge_yes
             elif edge_no > 0:
                 # BUY NO
                 direction = "BUY_NO"
                 entry_price = (1.0 - clob_bid) if clob_bid else (1.0 - market_price)
-                win_prob = 1.0 - our_prob
+                win_prob = 1.0 - bias_corrected_prob
                 payout = 1.0 - entry_price
                 edge = edge_no
             else:
                 # No positive edge on either side
+                continue
+
+            # ─── V3: DIRECTION FILTER ───
+            # BUY_YES had 0% win rate (0/8 positions lost $79.84)
+            # BUY_NO had 58% win rate (7/12 positions, slight loss due to sizing)
+            if direction == "BUY_YES" and not self.allow_buy_yes:
+                continue
+            if direction == "BUY_NO" and not self.allow_buy_no:
+                continue
+
+            # ─── V3: ENTRY PRICE FILTER ───
+            # Positions with entry price < 0.50 had 0% win rate
+            # Winning BUY_NO trades had avg entry = 0.664
+            if entry_price < self.min_entry_price:
+                continue
+            if entry_price > self.max_entry_price:
                 continue
 
             # Skip if edge too small
@@ -126,7 +151,7 @@ class EdgeDetector:
 
             # Calculate confidence based on ensemble agreement and edge size
             confidence = self._compute_confidence(
-                edge, ensemble_stats, our_prob, market_price
+                edge, ensemble_stats, bias_corrected_prob, market_price
             )
 
             if confidence < config.MIN_ENSEMBLE_AGREEMENT:
@@ -138,6 +163,12 @@ class EdgeDetector:
             # Expected value per dollar
             ev = win_prob * payout - (1 - win_prob) * entry_price
 
+            # ─── V3: Require positive EV after fees ───
+            # Polymarket has ~2% round-trip cost (spread + slippage)
+            FEE_ESTIMATE = 0.02
+            if ev < FEE_ESTIMATE:
+                continue
+
             # Suggested position size
             suggested_size = self._compute_position_size(
                 kelly_frac, bankroll, current_exposure, confidence, entry_price
@@ -145,13 +176,14 @@ class EdgeDetector:
 
             # Build reasoning
             reasons = self._build_reasons(
-                our_prob, market_price, edge, confidence, ensemble_stats, direction
+                our_prob, bias_corrected_prob, market_price, edge,
+                confidence, ensemble_stats, direction
             )
 
             signals.append(TradingSignal(
                 market=market,
                 outcome=outcome,
-                our_probability=our_prob,
+                our_probability=bias_corrected_prob,
                 market_price=market_price,
                 edge=edge,
                 edge_pct=edge_pct,
@@ -349,7 +381,8 @@ class EdgeDetector:
 
     def _build_reasons(
         self,
-        our_prob: float,
+        raw_prob: float,
+        bias_corrected_prob: float,
         market_price: float,
         edge: float,
         confidence: float,
@@ -360,8 +393,8 @@ class EdgeDetector:
         reasons = []
 
         reasons.append(
-            f"Our probability: {our_prob:.1%} vs Market: {market_price:.1%} "
-            f"(Edge: {edge:.1%})"
+            f"Raw forecast: {raw_prob:.1%}, Bias-corrected: {bias_corrected_prob:.1%} "
+            f"vs Market: {market_price:.1%} (Edge: {edge:.1%})"
         )
         reasons.append(f"Direction: {direction}")
         reasons.append(

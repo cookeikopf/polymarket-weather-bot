@@ -2,6 +2,13 @@
 Polymarket Weather Prediction Bot - Configuration
 ===================================================
 All tunable parameters in one place.
+
+V3 LIVE TRADING — Optimized based on retro-analysis of 20 paper positions:
+- BUY_YES disabled (0% win rate across 8 positions)
+- BUY_NO only (58% win rate across 12 positions)
+- Min entry price raised to 0.55 (entry < 0.50 = 0% win rate)
+- Edge threshold raised to 0.10 (edge ≤ 30% = 31% win rate, edge > 30% = 50%)
+- Conservative position sizing for real money
 """
 
 import os
@@ -222,57 +229,70 @@ MC_SAMPLES = 10000
 TEMP_BUCKET_SIZE_F = 2
 
 # ═══════════════════════════════════════════════════════════════════
+# STRATEGY FILTERS (V3 — data-driven from retro-analysis)
+# ═══════════════════════════════════════════════════════════════════
+# Direction filter: BUY_YES had 0% win rate (0/8), BUY_NO had 58% (7/12)
+# Root cause: forecasts systematically overestimate extreme/tail outcomes
+ALLOW_BUY_YES = False   # DISABLED — all 8 BUY_YES positions lost
+ALLOW_BUY_NO = True     # 58% win rate, the only profitable direction
+
+# Entry price filter: positions with entry < 0.50 had 0% win rate
+# Winning BUY_NO avg entry = 0.664, losing = 0.596
+MIN_ENTRY_PRICE = 0.55   # Only trade high-probability outcomes (NO side)
+MAX_ENTRY_PRICE = 0.85   # Avoid near-certain outcomes (low payout)
+
+# ═══════════════════════════════════════════════════════════════════
 # EDGE DETECTION & TRADING SIGNALS
 # ═══════════════════════════════════════════════════════════════════
 # Minimum edge (our prob - market prob) to enter a trade
-MIN_EDGE_PCT = 0.03  # 3% minimum edge — lowered for paper trading to capture more signals
+# Retro-analysis: edge > 30% = 50% win rate, edge ≤ 30% = 31% win rate
+MIN_EDGE_PCT = 0.10  # 10% minimum edge (was 3% in paper trading)
 
 # Minimum absolute probability for a bucket to be tradeable
-MIN_PROBABILITY = 0.02  # 2% — lowered for paper trading data collection
-
-# Maximum price we'll pay for a share (avoid illiquid extremes)
-MAX_ENTRY_PRICE = 0.92
+MIN_PROBABILITY = 0.05  # 5% (was 2% in paper trading)
 
 # Confidence threshold (0-1) from ensemble agreement
-MIN_ENSEMBLE_AGREEMENT = 0.40  # 40% — lowered for paper trading to capture more signals
+MIN_ENSEMBLE_AGREEMENT = 0.50  # 50% (was 40% in paper trading)
 
 # ═══════════════════════════════════════════════════════════════════
-# KELLY CRITERION & POSITION SIZING
+# KELLY CRITERION & POSITION SIZING (CONSERVATIVE for live trading)
 # ═══════════════════════════════════════════════════════════════════
 # Fractional Kelly (full Kelly is too aggressive)
-KELLY_FRACTION = 0.20  # Fifth Kelly — still conservative, size controlled by MAX_TRADE_SIZE_USDC
+KELLY_FRACTION = 0.15  # 15% Kelly — very conservative for live
 
 # Maximum position size as fraction of bankroll
-MAX_POSITION_PCT = 0.02  # 2% per trade — small bets, many trades
+MAX_POSITION_PCT = 0.05  # 5% per trade max
 
 # Maximum number of concurrent positions
-MAX_CONCURRENT_POSITIONS = 100  # Paper trading: capture every signal across all markets
+MAX_CONCURRENT_POSITIONS = 10  # Max 10 open positions
 
 # Maximum total exposure (sum of all positions / bankroll)
-MAX_TOTAL_EXPOSURE = 0.95  # Paper trading: 95% — almost no cap, maximize data
+MAX_TOTAL_EXPOSURE = 0.50  # 50% max — keep 50% in reserve
 
 # Minimum trade size in USDC
 # Polymarket requires ≥5 shares per order. At price 0.74, $5→6.8 shares (valid).
-# At price 0.40, $5→12.5 shares (valid). Must be ≥5 to avoid rejected orders.
 MIN_TRADE_SIZE_USDC = 5.0
 
 # Maximum trade size in USDC
-MAX_TRADE_SIZE_USDC = 10.0  # $10 max bet — small positions, many trades for data collection
+MAX_TRADE_SIZE_USDC = 10.0  # $10 max per trade
 
 # ═══════════════════════════════════════════════════════════════════
-# RISK MANAGEMENT
+# RISK MANAGEMENT (STRICT for live trading)
 # ═══════════════════════════════════════════════════════════════════
-# Stop trading if drawdown exceeds this
-MAX_DRAWDOWN_PCT = 0.50  # 50% — paper trading: don't stop collecting data on drawdown
+# Daily loss limit — stop all trading if daily P&L hits this
+MAX_DAILY_LOSS_USDC = 20.0  # Stop after losing $20 in a single day
+
+# Stop trading if total drawdown exceeds this
+MAX_DRAWDOWN_PCT = 0.20  # 20% max drawdown (was 50% in paper)
 
 # Take profit if edge narrows below this
-TAKE_PROFIT_EDGE_PCT = 0.02  # Exit if edge < 2%
+TAKE_PROFIT_EDGE_PCT = 0.03  # Exit if edge < 3%
 
 # Time-based exit: exit position X hours before market resolution
-EXIT_HOURS_BEFORE_RESOLUTION = 2
+EXIT_HOURS_BEFORE_RESOLUTION = 3  # 3 hours (was 2 in paper)
 
 # Trailing stop on unrealized P&L
-TRAILING_STOP_PCT = 0.30  # 30% of peak unrealized profit
+TRAILING_STOP_PCT = 0.25  # 25% of peak unrealized profit (tighter than paper)
 
 # ═══════════════════════════════════════════════════════════════════
 # BACKTESTING
@@ -280,7 +300,7 @@ TRAILING_STOP_PCT = 0.30  # 30% of peak unrealized profit
 BACKTEST_START_DATE = "2024-01-01"
 BACKTEST_END_DATE = "2026-03-15"
 BACKTEST_INITIAL_BANKROLL = 100.0  # Starting capital (adjustable via .env)
-LIVE_BANKROLL = float(os.getenv("POLYMARKET_BANKROLL", "1000.0"))  # $1000 paper bankroll for max data collection
+LIVE_BANKROLL = float(os.getenv("POLYMARKET_BANKROLL", "100.0"))  # $100 live bankroll — start small
 
 # Simulated market parameters
 SIM_SPREAD = 0.06        # 6% bid-ask spread (realistic for weather markets)
@@ -290,9 +310,9 @@ SIM_MARKET_NOISE = 0.015 # Market prices are fairly efficient
 # ═══════════════════════════════════════════════════════════════════
 # OPERATIONAL
 # ═══════════════════════════════════════════════════════════════════
-SCAN_INTERVAL_SECONDS = 900  # Check markets every 15 min (was 5min, reduced to avoid CLOB rate limits)
+SCAN_INTERVAL_SECONDS = 1800  # Check markets every 30 min (was 15min — reduce API load)
 LOG_LEVEL = "INFO"
-PAPER_TRADING = True  # Start in paper mode
+PAPER_TRADING = False  # *** LIVE MODE ***
 DATA_DIR = "data"
 RESULTS_DIR = "results"
 
@@ -315,11 +335,11 @@ CLIMATE_ZONES = {
     "South_Asia": ["Singapore", "Lucknow"],
     "Oceania": ["Wellington"],
 }
-MAX_POSITIONS_PER_ZONE = 15  # Paper trading: no zone restrictions
+MAX_POSITIONS_PER_ZONE = 3  # Max 3 positions per climate zone (was 15 in paper)
 
 # Slug-based market discovery: number of days ahead to scan
-# 3 days ahead: better forecasts, more liquid markets, fewer API calls
-MARKET_SCAN_DAYS_AHEAD = 5  # Scan 5 days ahead — more markets = more data
+# 2 days: better forecasts, more accurate — longer horizon = worse accuracy
+MARKET_SCAN_DAYS_AHEAD = 2  # Only scan 2 days ahead (was 5 in paper)
 
 # ═══════════════════════════════════════════════════════════════════
 # WEATHER UNDERGROUND (Resolution Data Source)
