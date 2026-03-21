@@ -52,11 +52,16 @@ class WeatherEngine:
     _forecast_cache_time: Dict[tuple, float] = {}  # cache timestamps
     CACHE_TTL_SECONDS = 5400  # Refresh forecasts every 90 min (reduce API load)
 
+    # Global rate-limit state shared across all WeatherEngine instances
+    _global_rate_limited = False
+    _global_rate_limit_until = 0.0
+
     def fetch_multi_model_forecasts(
         self, target_date: str, variable: str = "temperature_2m_max"
     ) -> Dict[str, float]:
         """
         Fetch forecasts from multiple NWP models for a target date.
+        Uses BATCHED requests (all models in 1 call) to minimize API load.
         Results are cached in memory to avoid redundant API calls across scan cycles.
 
         Returns: {model_name: forecast_value}
@@ -67,11 +72,70 @@ class WeatherEngine:
             if cache_age < WeatherEngine.CACHE_TTL_SECONDS:
                 return WeatherEngine._forecast_cache[cache_key]
 
-        forecasts = {}
-        failures = 0
-        backoff = 0.5  # Start with 0.5s between calls
+        # If globally rate-limited, skip entirely until cooldown expires
+        if WeatherEngine._global_rate_limited:
+            if time.time() < WeatherEngine._global_rate_limit_until:
+                return {}
+            else:
+                WeatherEngine._global_rate_limited = False
 
-        for model in config.WEATHER_MODELS:
+        forecasts = {}
+
+        # ─── STRATEGY: Batch all non-default models in ONE API call ───
+        # Open-Meteo accepts comma-separated model names, returning all in one response.
+        # This cuts API calls from 8 per city to just 2 (1 batch + 1 best_match).
+
+        non_default_models = [m for m in config.WEATHER_MODELS if m != "best_match"]
+
+        # Call 1: Batch all named models in a single request
+        if non_default_models:
+            try:
+                params = {
+                    "latitude": self.lat,
+                    "longitude": self.lon,
+                    "daily": variable,
+                    "timezone": self.tz,
+                    "start_date": target_date,
+                    "end_date": target_date,
+                    "temperature_unit": self.unit,
+                    "models": ",".join(non_default_models),
+                }
+
+                resp = requests.get(config.OPEN_METEO_FORECAST_URL, params=params, timeout=20)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    # Batch response has model-specific keys: "daily" contains
+                    # "temperature_2m_max_ecmwf_ifs025", etc.
+                    if "daily" in data:
+                        daily = data["daily"]
+                        # Try model-specific keys first (batch response format)
+                        for model in non_default_models:
+                            model_key = f"{variable}_{model}"
+                            if model_key in daily:
+                                values = daily[model_key]
+                                if values and values[0] is not None:
+                                    forecasts[model] = float(values[0])
+                        # Also check plain key (single-model response format)
+                        if variable in daily and len(forecasts) == 0:
+                            values = daily[variable]
+                            if values and values[0] is not None:
+                                # Assign to first model as fallback
+                                forecasts[non_default_models[0]] = float(values[0])
+                elif resp.status_code == 429:
+                    wait_time = 120  # 2 minute global cooldown
+                    print(f"  RATE LIMITED (429): Global cooldown {wait_time}s for {self.station_id}")
+                    WeatherEngine._global_rate_limited = True
+                    WeatherEngine._global_rate_limit_until = time.time() + wait_time
+                    time.sleep(5)  # Brief sleep before returning
+                    return {}
+
+                time.sleep(1.0)  # Pause between calls
+            except Exception as e:
+                print(f"  Warning: Batch forecast failed for {self.station_id}: {e}")
+                time.sleep(1.0)
+
+        # Call 2: Fetch best_match (default model, no "models" param)
+        if "best_match" in config.WEATHER_MODELS:
             try:
                 params = {
                     "latitude": self.lat,
@@ -82,51 +146,26 @@ class WeatherEngine:
                     "end_date": target_date,
                     "temperature_unit": self.unit,
                 }
-                if model != "best_match":
-                    params["models"] = model
-
                 resp = requests.get(config.OPEN_METEO_FORECAST_URL, params=params, timeout=15)
                 if resp.status_code == 200:
                     data = resp.json()
                     if "daily" in data and variable in data["daily"]:
                         values = data["daily"][variable]
                         if values and values[0] is not None:
-                            forecasts[model] = float(values[0])
-                            backoff = 0.5  # Reset backoff on success
-                        else:
-                            failures += 1
-                    else:
-                        failures += 1
+                            forecasts["best_match"] = float(values[0])
                 elif resp.status_code == 429:
-                    # Exponential backoff: 5s, 10s, 20s, 40s
-                    wait = min(backoff * 10, 60)
-                    print(f"  WARNING: Open-Meteo rate limited (429) for {model}, waiting {wait:.0f}s")
-                    time.sleep(wait)
-                    backoff = min(backoff * 2, 8)  # Increase backoff
-                    # Retry once after waiting
-                    resp = requests.get(config.OPEN_METEO_FORECAST_URL, params=params, timeout=15)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if "daily" in data and variable in data["daily"]:
-                            values = data["daily"][variable]
-                            if values and values[0] is not None:
-                                forecasts[model] = float(values[0])
-                            else:
-                                failures += 1
-                        else:
-                            failures += 1
-                    else:
-                        failures += 1
-                else:
-                    failures += 1
-                time.sleep(backoff)  # Pace API calls
+                    WeatherEngine._global_rate_limited = True
+                    WeatherEngine._global_rate_limit_until = time.time() + 120
+                time.sleep(1.0)
             except Exception as e:
-                print(f"  Warning: Failed to fetch {model}: {e}")
-                failures += 1
-                time.sleep(backoff)
+                print(f"  Warning: best_match forecast failed: {e}")
 
-        if failures > 0 and len(forecasts) > 0:
-            print(f"  Forecasts for {self.station_id}/{target_date}: {len(forecasts)} OK, {failures} failed")
+        if forecasts:
+            n_total = len(config.WEATHER_MODELS)
+            if len(forecasts) < n_total:
+                print(f"  Forecasts for {self.station_id}/{target_date}: {len(forecasts)}/{n_total} models")
+        else:
+            print(f"  WARNING: No forecasts for {self.station_id}/{target_date}")
 
         # Cache successful results (even partial)
         if forecasts:
@@ -140,11 +179,61 @@ class WeatherEngine:
     ) -> Dict[str, List[float]]:
         """
         Fetch hourly temperature forecasts from all models for a target date.
-        This gives us the full diurnal cycle to compute max temp ourselves.
+        Uses batched requests to minimize API load.
         """
         hourly_forecasts = {}
 
-        for model in config.WEATHER_MODELS:
+        # Check global rate limit
+        if WeatherEngine._global_rate_limited:
+            if time.time() < WeatherEngine._global_rate_limit_until:
+                return {}
+            else:
+                WeatherEngine._global_rate_limited = False
+
+        non_default_models = [m for m in config.WEATHER_MODELS if m != "best_match"]
+
+        # Batch call for all named models
+        if non_default_models:
+            try:
+                params = {
+                    "latitude": self.lat,
+                    "longitude": self.lon,
+                    "hourly": "temperature_2m",
+                    "timezone": self.tz,
+                    "start_date": target_date,
+                    "end_date": target_date,
+                    "temperature_unit": self.unit,
+                    "models": ",".join(non_default_models),
+                }
+                resp = requests.get(config.OPEN_METEO_FORECAST_URL, params=params, timeout=20)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if "hourly" in data:
+                        hourly = data["hourly"]
+                        for model in non_default_models:
+                            model_key = f"temperature_2m_{model}"
+                            if model_key in hourly:
+                                temps = hourly[model_key]
+                                valid_temps = [t for t in temps if t is not None]
+                                if valid_temps:
+                                    hourly_forecasts[model] = valid_temps
+                        # Fallback: plain key
+                        if "temperature_2m" in hourly and not hourly_forecasts:
+                            temps = hourly["temperature_2m"]
+                            valid_temps = [t for t in temps if t is not None]
+                            if valid_temps:
+                                hourly_forecasts[non_default_models[0]] = valid_temps
+                elif resp.status_code == 429:
+                    WeatherEngine._global_rate_limited = True
+                    WeatherEngine._global_rate_limit_until = time.time() + 120
+                    return {}
+                time.sleep(1.0)
+            except Exception as e:
+                print(f"  Warning: Batch hourly forecast failed: {e}")
+                time.sleep(1.0)
+
+        # best_match call
+        if "best_match" in config.WEATHER_MODELS:
             try:
                 params = {
                     "latitude": self.lat,
@@ -155,9 +244,6 @@ class WeatherEngine:
                     "end_date": target_date,
                     "temperature_unit": self.unit,
                 }
-                if model != "best_match":
-                    params["models"] = model
-
                 resp = requests.get(config.OPEN_METEO_FORECAST_URL, params=params, timeout=15)
                 if resp.status_code == 200:
                     data = resp.json()
@@ -165,21 +251,13 @@ class WeatherEngine:
                         temps = data["hourly"]["temperature_2m"]
                         valid_temps = [t for t in temps if t is not None]
                         if valid_temps:
-                            hourly_forecasts[model] = valid_temps
+                            hourly_forecasts["best_match"] = valid_temps
                 elif resp.status_code == 429:
-                    time.sleep(10)  # Rate limit backoff
-                    resp = requests.get(config.OPEN_METEO_FORECAST_URL, params=params, timeout=15)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if "hourly" in data and "temperature_2m" in data["hourly"]:
-                            temps = data["hourly"]["temperature_2m"]
-                            valid_temps = [t for t in temps if t is not None]
-                            if valid_temps:
-                                hourly_forecasts[model] = valid_temps
-                time.sleep(0.5)  # Pace API calls
+                    WeatherEngine._global_rate_limited = True
+                    WeatherEngine._global_rate_limit_until = time.time() + 120
+                time.sleep(1.0)
             except Exception as e:
-                print(f"  Warning: Failed to fetch hourly {model}: {e}")
-                time.sleep(0.5)
+                print(f"  Warning: best_match hourly failed: {e}")
 
         return hourly_forecasts
 
