@@ -779,18 +779,15 @@ class LiveTrader:
             # Gradual position reduction instead of hard 2h cutoff
             if hours_to_resolution < 6:
                 if hours_to_resolution < 2:
-                    # Hard exit unless deep in profit
-                    unrealized_pnl = self._estimate_unrealized_pnl(pos)
-                    if unrealized_pnl > pos.size_usd * 0.3:
-                        # Deep in profit - let it ride to resolution
-                        print(f"  Letting {pos.outcome_name} ride (profit: ${unrealized_pnl:.2f})")
-                    else:
-                        print(f"  Exiting {pos.outcome_name} - 2h to resolution")
-                        self._exit_position(pos, "time_exit")
+                    # Hard exit: close position near resolution
+                    # Don't try to estimate P&L for ride-to-resolution decision —
+                    # just close all positions within 2h of resolution
+                    logger.info(f"  Exiting {pos.outcome_name} - {hours_to_resolution:.1f}h to resolution")
+                    self._exit_position(pos, "time_exit")
                 elif hours_to_resolution < 6:
                     # Reduce 50% of position at 6h mark
                     if pos.shares > 0 and not hasattr(pos, '_reduced'):
-                        print(f"  Reducing {pos.outcome_name} by 50% - 6h to resolution")
+                        logger.info(f"  Reducing {pos.outcome_name} by 50% - {hours_to_resolution:.1f}h to resolution")
                         self._reduce_position(pos, 0.5)
 
     def _check_take_profit(self, pos: Position) -> bool:
@@ -832,30 +829,69 @@ class LiveTrader:
         return False
 
     def _estimate_unrealized_pnl(self, pos: Position) -> float:
-        """Estimate unrealized P&L for a position."""
-        # In paper mode, approximate based on entry edge
-        # Positive edge at entry suggests the position should be profitable
-        if pos.direction == "BUY_YES":
-            estimated_current_price = pos.entry_price + pos.current_edge * 0.5
-            return pos.shares * (estimated_current_price - pos.entry_price)
-        else:
-            estimated_current_price = pos.entry_price - pos.current_edge * 0.5
-            return pos.shares * (pos.entry_price - estimated_current_price)
+        """Estimate unrealized P&L by fetching LIVE market price from CLOB.
+
+        For paper trading, we MUST check the real current market price,
+        not estimate from entry edge (which always returns positive = fake profits).
+
+        P&L calculation:
+        - BUY_YES: bought at entry_price, current value = current_price
+          P&L = shares * (current_price - entry_price)
+        - BUY_NO: bought NO at entry_price, current NO value = 1 - current_YES_price
+          P&L = shares * ((1 - current_YES_price) - entry_price)
+        """
+        # Try to get live price from CLOB
+        try:
+            if pos.token_id and not pos.token_id.startswith("sim_"):
+                depth = self.scanner.fetch_orderbook_depth(pos.token_id)
+                if depth["has_liquidity"]:
+                    current_mid = (depth["best_bid"] + depth["best_ask"]) / 2.0
+                    if pos.direction == "BUY_YES":
+                        # YES share value is the current YES price
+                        return pos.shares * (current_mid - pos.entry_price)
+                    else:
+                        # NO share value = 1 - YES price
+                        current_no_price = 1.0 - current_mid
+                        return pos.shares * (current_no_price - pos.entry_price)
+        except Exception:
+            pass
+
+        # Fallback: can't get live price, return 0 (unknown)
+        return 0.0
 
     def _reduce_position(self, pos: Position, fraction: float):
-        """Reduce a position by a fraction (e.g., 0.5 = close half)."""
+        """Reduce a position by a fraction (e.g., 0.5 = close half).
+
+        Fetches the REAL current market price from CLOB to compute actual P&L.
+        """
         exit_shares = pos.shares * fraction
         exit_size = pos.size_usd * fraction
 
-        # Record partial exit
-        pnl = self._estimate_unrealized_pnl(pos) * fraction
+        # Fetch REAL exit price from CLOB
+        exit_price = pos.entry_price  # fallback
+        try:
+            if pos.token_id and not pos.token_id.startswith("sim_"):
+                depth = self.scanner.fetch_orderbook_depth(pos.token_id)
+                if depth["has_liquidity"]:
+                    if pos.direction == "BUY_YES":
+                        # Selling YES shares: we receive the bid price
+                        exit_price = depth["best_bid"]
+                    else:
+                        # Selling NO shares: NO value = 1 - YES ask
+                        exit_price = 1.0 - depth["best_ask"]
+        except Exception:
+            pass
+
+        # Calculate real P&L
+        pnl = exit_shares * (exit_price - pos.entry_price)
+
         self.trade_history.append(TradeRecord(
             market_slug=pos.market_slug,
             outcome_name=pos.outcome_name,
             station_id=pos.station_id,
             direction=pos.direction,
             entry_price=pos.entry_price,
-            exit_price=pos.entry_price,  # approximate
+            exit_price=exit_price,
             shares=exit_shares,
             size_usd=exit_size,
             pnl=pnl,
@@ -870,11 +906,31 @@ class LiveTrader:
         pos.size_usd -= exit_size
         self.bankroll += exit_size + pnl
 
+        logger.info(f"  [PARTIAL EXIT] {pos.outcome_name}: sold {exit_shares:.2f} shares "
+                    f"@ {exit_price:.3f} (entry: {pos.entry_price:.3f}), P&L: ${pnl:+.2f}")
+
         self._save_state()
 
     def _exit_position(self, position: Position, reason: str = "time_exit"):
-        """Exit a position (paper or live) and record trade."""
-        pnl = self._estimate_unrealized_pnl(position)
+        """Exit a position (paper or live) and record trade.
+
+        Fetches the REAL current market price from CLOB to compute actual P&L.
+        For resolved markets (no liquidity), P&L = 0 (conservative fallback).
+        """
+        # Fetch REAL exit price from CLOB
+        exit_price = position.entry_price  # fallback = breakeven
+        try:
+            if position.token_id and not position.token_id.startswith("sim_"):
+                depth = self.scanner.fetch_orderbook_depth(position.token_id)
+                if depth["has_liquidity"]:
+                    if position.direction == "BUY_YES":
+                        exit_price = depth["best_bid"]  # sell YES at bid
+                    else:
+                        exit_price = 1.0 - depth["best_ask"]  # sell NO = 1 - YES ask
+        except Exception:
+            pass
+
+        pnl = position.shares * (exit_price - position.entry_price)
 
         record = TradeRecord(
             market_slug=position.market_slug,
@@ -882,7 +938,7 @@ class LiveTrader:
             station_id=position.station_id,
             direction=position.direction,
             entry_price=position.entry_price,
-            exit_price=position.entry_price,  # approximate for paper
+            exit_price=exit_price,
             shares=position.shares,
             size_usd=position.size_usd,
             pnl=pnl,
@@ -900,8 +956,9 @@ class LiveTrader:
 
         self._save_state()
 
-        print(f"  [{'PAPER' if self.paper_mode else 'LIVE'}] Exited {position.outcome_name} "
-              f"(reason: {reason}, P&L: ${pnl:+.2f})")
+        logger.info(f"  [{'PAPER' if self.paper_mode else 'LIVE'}] Exited {position.outcome_name} "
+                    f"@ {exit_price:.3f} (entry: {position.entry_price:.3f}) "
+                    f"reason: {reason}, P&L: ${pnl:+.2f}")
 
     def _slug_to_target_date(self, slug: str) -> Optional[str]:
         """Extract target date from a market slug."""
