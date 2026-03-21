@@ -3,12 +3,18 @@ Polymarket Weather Prediction Bot - Configuration
 ===================================================
 All tunable parameters in one place.
 
-V3 LIVE TRADING — Optimized based on retro-analysis of 20 paper positions:
-- BUY_YES disabled (0% win rate across 8 positions)
-- BUY_NO only (58% win rate across 12 positions)
-- Min entry price raised to 0.55 (entry < 0.50 = 0% win rate)
-- Edge threshold raised to 0.10 (edge ≤ 30% = 31% win rate, edge > 30% = 50%)
-- Conservative position sizing for real money
+V4 DUAL STRATEGY — Optimized from retro-analysis + competitive research:
+
+STRATEGY 1 - LADDER (primary profit driver):
+  Buy YES in 3-5 buckets around ensemble median at low prices (<$0.20)
+  85%+ hit rate on 1-day forecasts, 700-1900% payout per winning bucket
+  This is how the $24k+ bots (neobrother etc.) operate
+
+STRATEGY 2 - CONSERVATIVE NO (steady income):
+  Buy NO on unlikely outcomes at high entry (>=0.65)
+  80% win rate from retro-analysis data
+
+KEY: Weather markets have NO taker fees on Polymarket.
 """
 
 import os
@@ -229,30 +235,42 @@ MC_SAMPLES = 10000
 TEMP_BUCKET_SIZE_F = 2
 
 # ═══════════════════════════════════════════════════════════════════
-# STRATEGY FILTERS (V3 — data-driven from retro-analysis)
+# STRATEGY 1: LADDER (BUY_YES around ensemble median)
 # ═══════════════════════════════════════════════════════════════════
-# Direction filter: BUY_YES had 0% win rate (0/8), BUY_NO had 58% (7/12)
-# Root cause: forecasts systematically overestimate extreme/tail outcomes
-ALLOW_BUY_YES = False   # DISABLED — all 8 BUY_YES positions lost
-ALLOW_BUY_NO = True     # 58% win rate, the only profitable direction
+# Buy YES shares in 3-5 buckets centered on the ensemble temperature median
+# Only buy at LOW prices → massive asymmetric payout if correct
+LADDER_ENABLED = True
+LADDER_MAX_ENTRY_PRICE = 0.20   # Only buy shares priced < $0.20 (500%+ potential return)
+LADDER_BUCKETS = 5              # Buy up to 5 adjacent buckets
+LADDER_BET_PER_BUCKET = 2.0     # $2 per bucket = $10 max per ladder set
+LADDER_MAX_SETS_PER_CYCLE = 3   # Max 3 ladder sets per scan cycle
 
-# Entry price filter: positions with entry < 0.50 had 0% win rate
-# Winning BUY_NO avg entry = 0.664, losing = 0.596
-MIN_ENTRY_PRICE = 0.55   # Only trade high-probability outcomes (NO side)
-MAX_ENTRY_PRICE = 0.85   # Avoid near-certain outcomes (low payout)
+# ═══════════════════════════════════════════════════════════════════
+# STRATEGY 2: CONSERVATIVE BUY_NO (steady income)
+# ═══════════════════════════════════════════════════════════════════
+ALLOW_BUY_YES = True    # V4: YES enabled for ladder strategy
+ALLOW_BUY_NO = True     # Conservative NO arm
+
+# Conservative NO: only at high entry (= high probability we win)
+CONSERVATIVE_NO_MIN_ENTRY = 0.65  # 80% WR from retro-analysis data
+CONSERVATIVE_NO_MAX_ENTRY = 0.85  # Avoid near-certain (low payout)
+
+# Legacy (used by conservative NO arm)
+MIN_ENTRY_PRICE = 0.65   # For BUY_NO strategy
+MAX_ENTRY_PRICE = 0.85   # For BUY_NO strategy
 
 # ═══════════════════════════════════════════════════════════════════
 # EDGE DETECTION & TRADING SIGNALS
 # ═══════════════════════════════════════════════════════════════════
-# Minimum edge (our prob - market prob) to enter a trade
-# Retro-analysis: edge > 30% = 50% win rate, edge ≤ 30% = 31% win rate
-MIN_EDGE_PCT = 0.10  # 10% minimum edge (was 3% in paper trading)
+# Minimum edge for CONSERVATIVE NO trades
+# Ladder trades don't require edge — they rely on forecast accuracy
+MIN_EDGE_PCT = 0.08  # 8% minimum edge for BUY_NO only
 
 # Minimum absolute probability for a bucket to be tradeable
-MIN_PROBABILITY = 0.05  # 5% (was 2% in paper trading)
+MIN_PROBABILITY = 0.02  # 2% — ladder buys low-prob buckets by design
 
 # Confidence threshold (0-1) from ensemble agreement
-MIN_ENSEMBLE_AGREEMENT = 0.50  # 50% (was 40% in paper trading)
+MIN_ENSEMBLE_AGREEMENT = 0.45  # 45% — slightly relaxed for more ladder opportunities
 
 # ═══════════════════════════════════════════════════════════════════
 # KELLY CRITERION & POSITION SIZING (CONSERVATIVE for live trading)
@@ -264,10 +282,10 @@ KELLY_FRACTION = 0.15  # 15% Kelly — very conservative for live
 MAX_POSITION_PCT = 0.05  # 5% per trade max
 
 # Maximum number of concurrent positions
-MAX_CONCURRENT_POSITIONS = 10  # Max 10 open positions
+MAX_CONCURRENT_POSITIONS = 25  # 3 ladder sets × 5 buckets + NO trades
 
 # Maximum total exposure (sum of all positions / bankroll)
-MAX_TOTAL_EXPOSURE = 0.50  # 50% max — keep 50% in reserve
+MAX_TOTAL_EXPOSURE = 0.60  # 60% max — keep 40% in reserve (ladder needs more capital)
 
 # Minimum trade size in USDC
 # Polymarket requires ≥5 shares per order. At price 0.74, $5→6.8 shares (valid).
@@ -300,7 +318,7 @@ TRAILING_STOP_PCT = 0.25  # 25% of peak unrealized profit (tighter than paper)
 BACKTEST_START_DATE = "2024-01-01"
 BACKTEST_END_DATE = "2026-03-15"
 BACKTEST_INITIAL_BANKROLL = 100.0  # Starting capital (adjustable via .env)
-LIVE_BANKROLL = float(os.getenv("POLYMARKET_BANKROLL", "100.0"))  # $100 live bankroll — start small
+LIVE_BANKROLL = float(os.getenv("POLYMARKET_BANKROLL", "100.0"))  # $100 live bankroll
 
 # Simulated market parameters
 SIM_SPREAD = 0.06        # 6% bid-ask spread (realistic for weather markets)
@@ -338,8 +356,9 @@ CLIMATE_ZONES = {
 MAX_POSITIONS_PER_ZONE = 3  # Max 3 positions per climate zone (was 15 in paper)
 
 # Slug-based market discovery: number of days ahead to scan
-# 2 days: better forecasts, more accurate — longer horizon = worse accuracy
-MARKET_SCAN_DAYS_AHEAD = 2  # Only scan 2 days ahead (was 5 in paper)
+# 1-2 days: NWP models are 85-90% accurate for 1-day forecasts
+# Longer horizons have significantly lower accuracy
+MARKET_SCAN_DAYS_AHEAD = 2  # Scan 1-2 days ahead (highest forecast accuracy)
 
 # ═══════════════════════════════════════════════════════════════════
 # WEATHER UNDERGROUND (Resolution Data Source)

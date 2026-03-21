@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Polymarket Weather Prediction Bot V3 - Main Entry Point
+Polymarket Weather Prediction Bot V4 - Main Entry Point
 =========================================================
 
-V3: Live-trading-ready with data-driven strategy from paper trading analysis.
+V4: Dual strategy - LADDER BUY_YES (primary) + CONSERVATIVE BUY_NO (secondary).
 
-Strategy: BUY_NO only, min entry 0.55, min edge 10%, daily loss limit $20.
+Strategy: Ladder YES around ensemble median (<$0.20) + Conservative NO (entry >= 0.65).
 
 Usage:
     python main.py backtest          Run full backtest
@@ -123,13 +123,13 @@ def cmd_live(duration: int = 60):
         print("  Continuing in EOA mode...\n")
 
     print("\n" + "=" * 60)
-    print("  LIVE TRADING MODE V3 — Real money at risk!")
+    print("  LIVE TRADING MODE V4 — Real money at risk!")
     print("=" * 60)
     print(f"  Duration:       {duration} minutes")
     print(f"  Bankroll:       ${config.LIVE_BANKROLL:.2f}")
-    print(f"  Strategy:       {'BUY_YES+BUY_NO' if config.ALLOW_BUY_YES else 'BUY_NO ONLY'}")
-    print(f"  Min Edge:       {config.MIN_EDGE_PCT:.0%}")
-    print(f"  Min Entry:      {config.MIN_ENTRY_PRICE}")
+    print(f"  Strategy:       LADDER + CONSERVATIVE NO")
+    print(f"  Ladder:         {config.LADDER_BUCKETS} buckets x ${config.LADDER_BET_PER_BUCKET}/ea (max ${config.LADDER_MAX_ENTRY_PRICE})")
+    print(f"  Conserv. NO:    entry {config.CONSERVATIVE_NO_MIN_ENTRY}-{config.CONSERVATIVE_NO_MAX_ENTRY}, edge >= {config.MIN_EDGE_PCT:.0%}")
     print(f"  Max per trade:  ${config.MAX_TRADE_SIZE_USDC:.2f}")
     print(f"  Max positions:  {config.MAX_CONCURRENT_POSITIONS}")
     print(f"  Max exposure:   {config.MAX_TOTAL_EXPOSURE:.0%} = ${config.LIVE_BANKROLL * config.MAX_TOTAL_EXPOSURE:.2f}")
@@ -164,29 +164,41 @@ def cmd_calibrate():
 
 def cmd_status():
     """Show bot configuration and status."""
-    print(f"\n{'='*55}")
-    print(f"  Polymarket Weather Bot V3 - Configuration")
-    print(f"{'='*55}")
+    print(f"\n{'='*60}")
+    print(f"  Polymarket Weather Bot V4 - Dual Strategy")
+    print(f"{'='*60}")
     print(f"  Paper Mode:           {config.PAPER_TRADING}")
-    print(f"  Strategy:             {'BUY_YES+BUY_NO' if config.ALLOW_BUY_YES else 'BUY_NO ONLY'}")
-    print(f"  Stations:             {list(config.STATIONS.keys())}")
-    print(f"  Weather Models:       {len(config.WEATHER_MODELS)}")
-    print(f"  Min Edge:             {config.MIN_EDGE_PCT:.0%}")
-    print(f"  Min Entry Price:      {config.MIN_ENTRY_PRICE}")
-    print(f"  Max Entry Price:      {config.MAX_ENTRY_PRICE}")
-    print(f"  Kelly Fraction:       {config.KELLY_FRACTION}")
-    print(f"  Max Position:         {config.MAX_POSITION_PCT:.0%}")
-    print(f"  Max Concurrent:       {config.MAX_CONCURRENT_POSITIONS}")
+    print(f"  Live Bankroll:        ${config.LIVE_BANKROLL}")
+    print(f"")
+    print(f"  --- LADDER STRATEGY (Primary) ---")
+    print(f"  Enabled:              {config.LADDER_ENABLED}")
+    print(f"  Buckets per ladder:   {config.LADDER_BUCKETS}")
+    print(f"  Bet per bucket:       ${config.LADDER_BET_PER_BUCKET}")
+    print(f"  Max entry price:      ${config.LADDER_MAX_ENTRY_PRICE}")
+    print(f"  Max sets per cycle:   {config.LADDER_MAX_SETS_PER_CYCLE}")
+    print(f"")
+    print(f"  --- CONSERVATIVE NO (Secondary) ---")
+    print(f"  Enabled:              {config.ALLOW_BUY_NO}")
+    print(f"  Entry range:          {config.CONSERVATIVE_NO_MIN_ENTRY} - {config.CONSERVATIVE_NO_MAX_ENTRY}")
+    print(f"  Min edge:             {config.MIN_EDGE_PCT:.0%}")
+    print(f"")
+    print(f"  --- RISK MANAGEMENT ---")
+    print(f"  Max Concurrent Pos:   {config.MAX_CONCURRENT_POSITIONS}")
+    print(f"  Max Exposure:         {config.MAX_TOTAL_EXPOSURE:.0%}")
     print(f"  Max Drawdown:         {config.MAX_DRAWDOWN_PCT:.0%}")
     print(f"  Daily Loss Limit:     ${config.MAX_DAILY_LOSS_USDC}")
-    print(f"  Scan Interval:        {config.SCAN_INTERVAL_SECONDS}s")
-    print(f"  Live Bankroll:        ${config.LIVE_BANKROLL}")
     print(f"  Max Trade Size:       ${config.MAX_TRADE_SIZE_USDC}")
+    print(f"")
+    print(f"  --- OPERATIONAL ---")
+    print(f"  Stations:             {len(config.STATIONS)} cities")
+    print(f"  Weather Models:       {len(config.WEATHER_MODELS)}")
+    print(f"  Scan Interval:        {config.SCAN_INTERVAL_SECONDS}s")
     print(f"  Scan Days Ahead:      {config.MARKET_SCAN_DAYS_AHEAD}")
+    print(f"  Order Strategy:       {config.ORDER_STRATEGY}")
     print(f"  Private Key Set:      {'Yes' if config.PRIVATE_KEY else 'No'}")
     print(f"  Funder Address Set:   {'Yes' if config.FUNDER_ADDRESS else 'No'}")
-    print(f"  Signature Type:       {config.SIGNATURE_TYPE}")
-    print(f"{'='*55}\n")
+    print(f"  Builder API Set:      {'Yes' if config.BUILDER_API_KEY else 'No'}")
+    print(f"{'='*60}\n")
 
 
 def main():

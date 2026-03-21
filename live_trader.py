@@ -1,16 +1,15 @@
 """
-Live Trading Module (V3 — Production-Ready)
-=============================================
+Live Trading Module (V4 — Dual Strategy)
+==========================================
 Handles real order execution on Polymarket CLOB.
 Supports both paper trading (simulation) and live trading.
 
-V3 CHANGES:
+V4 DUAL STRATEGY:
+- LADDER (primary): BUY_YES in 3-5 buckets around ensemble median at low prices
+- CONSERVATIVE NO (secondary): BUY_NO on unlikely outcomes at high entry (>=0.65)
+- No fee deductions (weather markets are fee-free)
 - Daily loss limit tracking (stops trading after MAX_DAILY_LOSS_USDC)
-- Pre-trade safety checks (direction filter, entry price filter)
-- Conservative position sizing for real money
-- Tighter risk management (20% max drawdown, 3h time exit)
-- State reset on new day (daily P&L tracking)
-- Enhanced logging for every decision
+- Smart exit strategy (take profit, edge decay, time-based)
 """
 
 import os
@@ -105,15 +104,15 @@ class LiveTrader:
         self._check_daily_reset()
 
         print(f"\n{'='*55}")
-        print(f"  Weather Prediction Bot V3")
+        print(f"  Weather Prediction Bot V4 (Dual Strategy)")
         print(f"  Mode: {'PAPER' if paper_mode else '*** LIVE ***'}")
         print(f"  Bankroll: ${self.bankroll:.2f}")
         print(f"  Open Positions: {len(self.positions)}")
         print(f"  Total Trades: {len(self.trade_history)}")
         print(f"  Daily P&L: ${self.daily_pnl:+.2f}")
-        print(f"  Direction: {'BUY_YES+BUY_NO' if config.ALLOW_BUY_YES else 'BUY_NO ONLY'}")
-        print(f"  Min Entry Price: {config.MIN_ENTRY_PRICE}")
-        print(f"  Min Edge: {config.MIN_EDGE_PCT:.0%}")
+        print(f"  Strategy: LADDER + CONSERVATIVE NO")
+        print(f"  Ladder: {config.LADDER_BUCKETS} buckets × ${config.LADDER_BET_PER_BUCKET}/ea, max price {config.LADDER_MAX_ENTRY_PRICE}")
+        print(f"  Conservative NO: entry {config.CONSERVATIVE_NO_MIN_ENTRY}-{config.CONSERVATIVE_NO_MAX_ENTRY}, edge >= {config.MIN_EDGE_PCT:.0%}")
         print(f"  Max Daily Loss: ${config.MAX_DAILY_LOSS_USDC}")
         print(f"  Max Drawdown: {config.MAX_DRAWDOWN_PCT:.0%}")
         print(f"{'='*55}\n")
@@ -495,68 +494,69 @@ class LiveTrader:
     # ═══════════════════════════════════════════════════════════════
 
     def _execute_signals(self, signals: List[TradingSignal]):
-        """Execute trading signals (paper or live) with all V3 safety checks."""
-        # Sort by risk-adjusted EV
-        signals.sort(key=lambda s: s.expected_value * s.confidence, reverse=True)
-
-        # ─── V3: Re-check safety before executing ───
+        """Execute trading signals with V4 dual strategy.
+        
+        Ladder signals are grouped by market and executed as a set.
+        Conservative NO signals are executed individually.
+        """
+        # ─── Re-check safety before executing ───
         blocking = self._pre_trade_checks()
         if blocking:
             for issue in blocking:
                 logger.warning(f"  EXECUTION BLOCKED: {issue}")
             return
 
-        executed = 0
-        max_trades_per_cycle = 5 if not self.paper_mode else 20  # V3: max 5 live trades per cycle
+        # Separate ladder signals from conservative NO signals
+        ladder_signals = [s for s in signals if getattr(s, 'strategy', '') == 'ladder']
+        no_signals = [s for s in signals if getattr(s, 'strategy', '') == 'conservative_no']
 
-        for signal in signals:
+        # Execute ladder signals (grouped by market)
+        ladder_sets_executed = 0
+        max_ladder_sets = getattr(config, 'LADDER_MAX_SETS_PER_CYCLE', 3)
+        
+        # Group ladder signals by market slug
+        from collections import defaultdict
+        ladder_by_market = defaultdict(list)
+        for s in ladder_signals:
+            ladder_by_market[s.market.slug].append(s)
+        
+        for slug, market_signals in ladder_by_market.items():
+            if ladder_sets_executed >= max_ladder_sets:
+                break
+            if self._check_daily_loss_limit():
+                break
+                
+            # Sort by distance from median (implicit via EV)
+            market_signals.sort(key=lambda s: s.expected_value * s.confidence, reverse=True)
+            
+            executed_in_set = 0
+            for signal in market_signals[:getattr(config, 'LADDER_BUCKETS', 5)]:
+                if self._pre_trade_check_single(signal):
+                    if self.paper_mode:
+                        self._paper_execute(signal)
+                    else:
+                        self._live_execute(signal)
+                    executed_in_set += 1
+            
+            if executed_in_set > 0:
+                ladder_sets_executed += 1
+                logger.info(f"  LADDER SET: {slug} — {executed_in_set} buckets")
+
+        # Execute conservative NO signals
+        no_signals.sort(key=lambda s: s.expected_value * s.confidence, reverse=True)
+        executed = 0
+        max_trades_per_cycle = 5 if not self.paper_mode else 20
+
+        for signal in no_signals:
             if executed >= max_trades_per_cycle:
                 break
 
-            # Re-check daily loss each trade
             if self._check_daily_loss_limit():
                 logger.warning("  Daily loss limit hit mid-cycle. Stopping execution.")
                 break
 
-            if signal.suggested_size_usd < config.MIN_TRADE_SIZE_USDC:
+            if not self._pre_trade_check_single(signal):
                 continue
-
-            # Check position limits
-            if len(self.positions) >= config.MAX_CONCURRENT_POSITIONS:
-                logger.info("  Max concurrent positions reached")
-                break
-
-            # ── BUG FIX: Prevent duplicate positions on same outcome ──
-            already_held = any(
-                p.market_slug == signal.market.slug
-                and p.outcome_name == signal.outcome.name
-                and p.direction == signal.direction
-                and p.status == "open"
-                for p in self.positions
-            )
-            if already_held:
-                logger.info(f"  DEDUP: Skipping '{signal.outcome.name}' on {signal.market.slug} — "
-                            f"already have open {signal.direction} position")
-                continue
-
-            # Check climate zone correlation limits
-            if not self._check_zone_capacity(signal.market.station_id):
-                logger.info(f"  Skipping {signal.market.station_id}: zone position limit reached")
-                continue
-
-            # ─── V3: LIVE ORDER EXECUTION WITH SAFETY ───
-            if not self.paper_mode:
-                # Check orderbook liquidity
-                if signal.outcome.token_id and not signal.outcome.token_id.startswith("sim_"):
-                    depth = self.scanner.fetch_orderbook_depth(signal.outcome.token_id)
-                    if not depth["has_liquidity"]:
-                        logger.info(f"  Skipping '{signal.outcome.name}': insufficient liquidity")
-                        continue
-                    # Adjust size if liquidity is thin
-                    available = depth["ask_depth"] if signal.direction == "BUY_YES" else depth["bid_depth"]
-                    if available > 0 and signal.suggested_size_usd > available * 0.5:
-                        signal.suggested_size_usd = min(signal.suggested_size_usd, available * 0.5)
-                        logger.info(f"  Reduced size to ${signal.suggested_size_usd:.2f} due to thin liquidity")
 
             if self.paper_mode:
                 self._paper_execute(signal)
@@ -565,7 +565,48 @@ class LiveTrader:
 
             executed += 1
 
-        logger.info(f"  Executed {executed} trades this cycle")
+        total_executed = ladder_sets_executed * getattr(config, 'LADDER_BUCKETS', 5) + executed
+        logger.info(f"  Executed {ladder_sets_executed} ladder sets + {executed} NO trades this cycle")
+
+    def _pre_trade_check_single(self, signal: TradingSignal) -> bool:
+        """Run pre-trade checks for a single signal. Returns True if OK to trade."""
+        # Min size check (ladder uses smaller bets)
+        min_size = config.MIN_TRADE_SIZE_USDC if signal.direction == "BUY_NO" else 1.0
+        if signal.suggested_size_usd < min_size:
+            return False
+
+        # Position limits
+        if len(self.positions) >= config.MAX_CONCURRENT_POSITIONS:
+            return False
+
+        # Dedup
+        already_held = any(
+            p.market_slug == signal.market.slug
+            and p.outcome_name == signal.outcome.name
+            and p.direction == signal.direction
+            and p.status == "open"
+            for p in self.positions
+        )
+        if already_held:
+            logger.info(f"  DEDUP: Skipping '{signal.outcome.name}' on {signal.market.slug}")
+            return False
+
+        # Zone capacity
+        if not self._check_zone_capacity(signal.market.station_id):
+            return False
+
+        # Liquidity check for live trading
+        if not self.paper_mode:
+            if signal.outcome.token_id and not signal.outcome.token_id.startswith("sim_"):
+                depth = self.scanner.fetch_orderbook_depth(signal.outcome.token_id)
+                if not depth["has_liquidity"]:
+                    logger.info(f"  Skipping '{signal.outcome.name}': insufficient liquidity")
+                    return False
+                available = depth["ask_depth"] if signal.direction == "BUY_YES" else depth["bid_depth"]
+                if available > 0 and signal.suggested_size_usd > available * 0.5:
+                    signal.suggested_size_usd = min(signal.suggested_size_usd, available * 0.5)
+
+        return True
 
     def _check_zone_capacity(self, station_id: str) -> bool:
         """Check if we can open another position in the same climate zone."""
@@ -992,7 +1033,7 @@ class LiveTrader:
         os.makedirs(config.RESULTS_DIR, exist_ok=True)
         state = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "version": "V3",
+            "version": "V4",
             "mode": "PAPER" if self.paper_mode else "LIVE",
             "bankroll": self.bankroll,
             "peak_bankroll": self.peak_bankroll,
@@ -1082,7 +1123,7 @@ class LiveTrader:
 
         report = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "version": "V3",
+            "version": "V4",
             "mode": "PAPER" if self.paper_mode else "LIVE",
             "bankroll": self.bankroll,
             "peak_bankroll": self.peak_bankroll,
@@ -1109,7 +1150,7 @@ class LiveTrader:
         report = self.compute_pnl_report()
 
         print(f"\n{'='*55}")
-        print(f"  P&L Report V3 ({report['mode']} Mode)")
+        print(f"  P&L Report V4 ({report['mode']} Mode)")
         print(f"{'='*55}")
         print(f"  Bankroll:          ${report['bankroll']:.2f}")
         print(f"  Peak Bankroll:     ${report['peak_bankroll']:.2f}")
@@ -1202,7 +1243,7 @@ class LiveTrader:
     def get_status(self) -> Dict:
         """Get current bot status."""
         return {
-            "version": "V3",
+            "version": "V4",
             "mode": "PAPER" if self.paper_mode else "LIVE",
             "bankroll": self.bankroll,
             "positions": len(self.positions),
@@ -1211,7 +1252,10 @@ class LiveTrader:
             "current_drawdown": (self.peak_bankroll - self.bankroll) / self.peak_bankroll * 100 if self.peak_bankroll > 0 else 0,
             "daily_pnl": self.daily_pnl,
             "daily_loss_halt": self.daily_loss_halt,
-            "strategy": "BUY_NO_ONLY" if not config.ALLOW_BUY_YES else "BUY_YES+BUY_NO",
+            "strategy": "LADDER + CONSERVATIVE_NO",
+            "ladder_buckets": config.LADDER_BUCKETS,
+            "ladder_max_price": config.LADDER_MAX_ENTRY_PRICE,
+            "ladder_bet_per_bucket": config.LADDER_BET_PER_BUCKET,
+            "conservative_no_min_entry": config.CONSERVATIVE_NO_MIN_ENTRY,
             "min_edge": config.MIN_EDGE_PCT,
-            "min_entry_price": config.MIN_ENTRY_PRICE,
         }
