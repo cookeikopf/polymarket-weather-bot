@@ -316,15 +316,38 @@ class LiveTrader:
                 logger.warning(f"  SKIP {market.station_id}/{market.target_date}: no bucket edges parsed from {len(market.outcomes)} outcomes")
                 continue
 
-            our_probs = engine.compute_probability_distribution(forecasts, bucket_edges)
+            # ─── V5: Try ensemble-based probabilities first ───
+            prob_method = "v4_mc"
+            drift_info = None
+            ensemble_data = engine.fetch_ensemble_forecasts(market.target_date)
+            if ensemble_data:
+                # Fetch drift info from previous model runs
+                drift_info = engine.fetch_previous_runs(market.target_date)
+                v5_probs = engine.compute_probability_distribution_v5(
+                    ensemble_data, bucket_edges, drift_info
+                )
+                if v5_probs:
+                    our_probs = v5_probs
+                    total_members = sum(len(m) for m in ensemble_data.values())
+                    prob_method = f"v5_ensemble({total_members}members)"
+                    logger.info(f"  V5 {market.station_id}/{market.target_date}: "
+                                f"{total_members} ensemble members, "
+                                f"drift={drift_info.get('direction', 'n/a')}")
+                else:
+                    our_probs = engine.compute_probability_distribution(forecasts, bucket_edges)
+            else:
+                our_probs = engine.compute_probability_distribution(forecasts, bucket_edges)
 
-            # Try ML model (better predictions if model file available)
+            # Try ML model as additional signal (better predictions if model file available)
             ml_probs = engine.compute_ml_probability_distribution(
                 forecasts, ensemble_stats, bucket_edges, market.target_date
             )
-            if ml_probs:
+            if ml_probs and prob_method.startswith("v4"):
                 our_probs = ml_probs
+                prob_method = "ml_model"
                 logger.debug(f"  {market.station_id}/{market.target_date}: using ML probabilities")
+
+            logger.info(f"  {market.station_id}/{market.target_date}: prob_method={prob_method}")
 
             # ── BUG FIX: Validate outcome label matching (phantom prevention) ──
             actual_outcome_names = {o.name for o in market.outcomes}

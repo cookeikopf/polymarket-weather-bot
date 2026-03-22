@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Polymarket Weather Prediction Bot V4 - Main Entry Point
+Polymarket Weather Prediction Bot V5 - Main Entry Point
 =========================================================
 
-V4: Dual strategy - LADDER BUY_YES (primary) + CONSERVATIVE BUY_NO (secondary).
-
-Strategy: Ladder YES around ensemble median (<$0.20) + Conservative NO (entry >= 0.65).
+V5: Professional API upgrade — ensemble probabilities + historical calibration + drift detection.
+Dual strategy: LADDER BUY_YES (primary) + CONSERVATIVE BUY_NO (secondary).
 
 Usage:
     python main.py backtest          Run full backtest
@@ -13,7 +12,8 @@ Usage:
     python main.py scan              Scan live markets (paper mode)
     python main.py paper [minutes]   Run paper trading
     python main.py live [minutes]    Run live trading (requires .env setup)
-    python main.py calibrate         Run calibration only
+    python main.py calibrate         Run calibration (V5 if API key set, else V4)
+    python main.py calibrate_v5      Run V5 calibration for all 20 stations
     python main.py status            Show bot configuration
 """
 
@@ -162,14 +162,56 @@ def cmd_calibrate():
         print(f"Calibration saved to {config.RESULTS_DIR}/calibration_{station_id}.json")
 
 
+def cmd_calibrate_v5():
+    """Run V5 calibration (ensemble + historical forecast API) for all stations."""
+    from weather_engine import WeatherEngine
+
+    if not config.OPEN_METEO_API_KEY:
+        print("WARNING: OPEN_METEO_API_KEY not set. V5 calibration requires Pro API access.")
+        print("Set OPEN_METEO_API_KEY in .env to enable V5 features.")
+        print("Falling back to V4 calibration...\n")
+        cmd_calibrate()
+        return
+
+    print(f"\n{'='*60}")
+    print(f"  V5 Calibration — Professional API")
+    print(f"  Stations: {len(config.STATIONS)}")
+    print(f"  Ensemble models: {getattr(config, 'ENSEMBLE_MODELS', [])}")
+    print(f"{'='*60}\n")
+
+    for station_id in config.STATIONS:
+        print(f"\nV5 Calibrating {station_id}...")
+        engine = WeatherEngine(station_id)
+        stats = engine.calibrate_v5()
+
+        if stats:
+            os.makedirs(config.RESULTS_DIR, exist_ok=True)
+            with open(f"{config.RESULTS_DIR}/v5_calibration_{station_id}.json", "w") as f:
+                json.dump(stats, f, indent=2, default=str)
+            print(f"  V5 calibration saved to {config.RESULTS_DIR}/v5_calibration_{station_id}.json")
+        else:
+            print(f"  V5 calibration failed for {station_id}, falling back to V4...")
+            engine.calibrate()
+
+
 def cmd_status():
     """Show bot configuration and status."""
+    v5_active = bool(config.OPEN_METEO_API_KEY)
+    version = "V5 (Pro API)" if v5_active else "V4"
+
     print(f"\n{'='*60}")
-    print(f"  Polymarket Weather Bot V4 - Dual Strategy")
+    print(f"  Polymarket Weather Bot {version} - Dual Strategy")
     print(f"{'='*60}")
     print(f"  Paper Mode:           {config.PAPER_TRADING}")
     print(f"  Live Bankroll:        ${config.LIVE_BANKROLL}")
     print(f"")
+    if v5_active:
+        print(f"  --- V5 PROFESSIONAL API ---")
+        print(f"  API Key:              Set")
+        print(f"  Ensemble Models:      {getattr(config, 'ENSEMBLE_MODELS', [])}")
+        print(f"  Previous Runs Days:   {getattr(config, 'PREVIOUS_RUNS_DAYS', 2)}")
+        print(f"  Ensemble URL:         {config.OPEN_METEO_ENSEMBLE_URL}")
+        print(f"")
     print(f"  --- LADDER STRATEGY (Primary) ---")
     print(f"  Enabled:              {config.LADDER_ENABLED}")
     print(f"  Buckets per ladder:   {config.LADDER_BUCKETS}")
@@ -198,6 +240,7 @@ def cmd_status():
     print(f"  Private Key Set:      {'Yes' if config.PRIVATE_KEY else 'No'}")
     print(f"  Funder Address Set:   {'Yes' if config.FUNDER_ADDRESS else 'No'}")
     print(f"  Builder API Set:      {'Yes' if config.BUILDER_API_KEY else 'No'}")
+    print(f"  Open-Meteo API Key:   {'Yes' if config.OPEN_METEO_API_KEY else 'No'}")
     print(f"{'='*60}\n")
 
 
@@ -222,6 +265,8 @@ def main():
         cmd_live(duration)
     elif command == "calibrate":
         cmd_calibrate()
+    elif command == "calibrate_v5":
+        cmd_calibrate_v5()
     elif command == "status":
         cmd_status()
     else:

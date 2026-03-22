@@ -61,6 +61,7 @@ OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_HISTORICAL_URL = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_HISTORICAL_FORECAST_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
 OPEN_METEO_PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
+OPEN_METEO_ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 
 # Station coordinates for ALL 20 Polymarket weather cities
 # Coordinates point to the exact weather station used for resolution
@@ -202,23 +203,41 @@ if OPEN_METEO_API_KEY:
     OPEN_METEO_HISTORICAL_URL = "https://customer-archive-api.open-meteo.com/v1/archive"
     OPEN_METEO_HISTORICAL_FORECAST_URL = "https://customer-historical-forecast-api.open-meteo.com/v1/forecast"
     OPEN_METEO_PREVIOUS_RUNS_URL = "https://customer-previous-runs-api.open-meteo.com/v1/forecast"
+    OPEN_METEO_ENSEMBLE_URL = "https://customer-ensemble-api.open-meteo.com/v1/ensemble"
 
-# Weather models — TOP 4 only (reduces API calls by 50% vs 8 models)
-# These 4 cover 72% of ensemble weight and provide sufficient diversity
+# Weather models — ALL 8 models (Pro API = no rate limits)
 WEATHER_MODELS = [
-    "best_match",          # Auto-selects best local model (weight: 0.30)
-    "ecmwf_ifs025",        # ECMWF IFS 0.25° — consistently best (weight: 0.35)
-    "gfs_seamless",        # GFS (US flagship, NOAA) (weight: 0.20)
-    "icon_seamless",       # ICON (German DWD) (weight: 0.15)
+    "best_match",              # Auto-selects best local model
+    "ecmwf_ifs025",            # ECMWF IFS 0.25° — consistently best
+    "gfs_seamless",            # GFS (US flagship, NOAA)
+    "icon_seamless",           # ICON (German DWD)
+    "gem_seamless",            # GEM (Canadian CMC)
+    "meteofrance_seamless",    # Meteo-France ARPEGE/AROME
+    "jma_seamless",            # JMA (Japan Met Agency)
+    "ukmo_seamless",           # UKMO (UK Met Office)
 ]
 
-# Model weights (normalized to sum to 1.0 for top 4)
+# Model weights (normalized to sum to 1.0 for all 8)
 MODEL_WEIGHTS = {
-    "best_match": 0.30,
-    "ecmwf_ifs025": 0.35,  # Consistently best
-    "gfs_seamless": 0.20,
-    "icon_seamless": 0.15,
+    "best_match": 0.18,
+    "ecmwf_ifs025": 0.22,     # Consistently best
+    "gfs_seamless": 0.15,
+    "icon_seamless": 0.12,
+    "gem_seamless": 0.08,
+    "meteofrance_seamless": 0.10,
+    "jma_seamless": 0.08,
+    "ukmo_seamless": 0.07,
 }
+
+# V5: Ensemble models for probabilistic forecasts (member-based)
+ENSEMBLE_MODELS = [
+    "ecmwf_ifs025",   # 51 members
+    "gfs025",          # 31 members
+    "icon_seamless",   # 40 members
+]
+
+# V5: Previous runs for drift detection
+PREVIOUS_RUNS_DAYS = 2  # Compare last 2 days of model runs
 
 # ═══════════════════════════════════════════════════════════════════
 # ML & PROBABILITY CALIBRATION
@@ -332,7 +351,7 @@ SIM_MARKET_NOISE = 0.015 # Market prices are fairly efficient
 # ═══════════════════════════════════════════════════════════════════
 # OPERATIONAL
 # ═══════════════════════════════════════════════════════════════════
-SCAN_INTERVAL_SECONDS = 1800  # Check markets every 30 min (was 15min — reduce API load)
+SCAN_INTERVAL_SECONDS = 900   # Check markets every 15 min (Pro API can handle it)
 LOG_LEVEL = "INFO"
 PAPER_TRADING = False  # *** LIVE MODE ***
 DATA_DIR = "data"

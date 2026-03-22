@@ -350,75 +350,6 @@ class WeatherEngine:
     # CALIBRATION: Learn Error Distributions
     # ═══════════════════════════════════════════════════════════════
 
-    def calibrate(self, lookback_years: int = None) -> Dict:
-        """
-        Build calibration model by comparing historical forecasts to actuals.
-        Returns calibration statistics.
-        """
-        if lookback_years is None:
-            lookback_years = config.CALIBRATION_YEARS
-
-        end_date = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
-        start_date = (datetime.now() - timedelta(days=365 * lookback_years)).strftime("%Y-%m-%d")
-
-        print(f"  Calibrating {self.station_id} from {start_date} to {end_date}...")
-
-        # Fetch actual data
-        actuals = self.fetch_historical_actuals(start_date, end_date)
-        print(f"  Loaded {len(actuals)} days of actual data")
-
-        # Fetch historical forecast data
-        forecasts = self.fetch_historical_forecasts(start_date, end_date)
-        print(f"  Loaded historical forecasts with {len(forecasts)} days")
-
-        if forecasts.empty or actuals.empty:
-            print("  Warning: Insufficient data for calibration, using defaults")
-            return self._default_calibration()
-
-        # Merge
-        merged = actuals.merge(forecasts, on="date", how="inner")
-        merged = merged.dropna()
-        print(f"  Merged dataset: {len(merged)} days")
-
-        if len(merged) < 30:
-            print("  Warning: Too few matched days, using defaults")
-            return self._default_calibration()
-
-        # Compute error distributions per model
-        calibration_stats = {}
-        forecast_cols = [c for c in merged.columns if c.startswith("forecast_")]
-
-        for col in forecast_cols:
-            model_name = col.replace("forecast_", "")
-            errors = merged["actual"] - merged[col]
-            valid_errors = errors.dropna()
-
-            if len(valid_errors) < 20:
-                continue
-
-            error_stats = {
-                "mean_bias": float(valid_errors.mean()),
-                "std": float(valid_errors.std()),
-                "mae": float(valid_errors.abs().mean()),
-                "rmse": float(np.sqrt((valid_errors ** 2).mean())),
-                "percentile_5": float(valid_errors.quantile(0.05)),
-                "percentile_95": float(valid_errors.quantile(0.95)),
-                "n_samples": len(valid_errors),
-            }
-            self.error_distributions[model_name] = error_stats
-            calibration_stats[model_name] = error_stats
-            print(f"  {model_name}: bias={error_stats['mean_bias']:.2f}°F, "
-                  f"RMSE={error_stats['rmse']:.2f}°F, MAE={error_stats['mae']:.2f}°F")
-
-        # Update model weights based on inverse RMSE
-        self._update_model_weights()
-
-        # Store for probability computation
-        self.historical_data = merged
-        self.calibration_model = calibration_stats
-
-        return calibration_stats
-
     def _default_calibration(self) -> Dict:
         """Default calibration stats when historical data is insufficient."""
         default = {
@@ -712,6 +643,516 @@ class WeatherEngine:
         except Exception as e:
             print(f"  Warning: Climatological prior failed: {e}")
             return {}
+
+    # ═══════════════════════════════════════════════════════════════
+    # V5: ENSEMBLE PROBABILISTIC FORECASTS (Professional API)
+    # ═══════════════════════════════════════════════════════════════
+
+    # Ensemble cache (separate from point-forecast cache)
+    _ensemble_cache: Dict[tuple, Dict[str, List[float]]] = {}
+    _ensemble_cache_time: Dict[tuple, float] = {}
+
+    def fetch_ensemble_forecasts(
+        self, target_date: str, variable: str = "temperature_2m_max"
+    ) -> Dict[str, List[float]]:
+        """
+        V5: Fetch ensemble member forecasts from Open-Meteo Ensemble API.
+
+        Calls customer-ensemble-api.open-meteo.com with models=ecmwf_ifs025,gfs025
+        Each model returns control + memberNN keys giving 82+ independent scenarios.
+
+        Returns: {model_name: [member_value_1, member_value_2, ...]}
+        """
+        cache_key = (self.station_id, target_date, variable, "ensemble")
+        if cache_key in WeatherEngine._ensemble_cache:
+            cache_age = time.time() - WeatherEngine._ensemble_cache_time.get(cache_key, 0)
+            if cache_age < WeatherEngine.CACHE_TTL_SECONDS:
+                return WeatherEngine._ensemble_cache[cache_key]
+
+        # Check global rate limit
+        if WeatherEngine._global_rate_limited:
+            if time.time() < WeatherEngine._global_rate_limit_until:
+                return {}
+            else:
+                WeatherEngine._global_rate_limited = False
+
+        ensemble_data = {}
+        ensemble_models = getattr(config, 'ENSEMBLE_MODELS', ["ecmwf_ifs025", "gfs025"])
+
+        try:
+            params = {
+                "latitude": self.lat,
+                "longitude": self.lon,
+                "daily": variable,
+                "timezone": self.tz,
+                "start_date": target_date,
+                "end_date": target_date,
+                "temperature_unit": self.unit,
+                "models": ",".join(ensemble_models),
+            }
+            if config.OPEN_METEO_API_KEY:
+                params["apikey"] = config.OPEN_METEO_API_KEY
+
+            resp = requests.get(config.OPEN_METEO_ENSEMBLE_URL, params=params, timeout=25)
+
+            if resp.status_code == 200:
+                data = resp.json()
+                if "daily" in data:
+                    daily = data["daily"]
+                    for model in ensemble_models:
+                        members = []
+                        # Control run (plain key with model suffix)
+                        control_key = f"{variable}_{model}"
+                        if control_key in daily:
+                            val = daily[control_key]
+                            if isinstance(val, list) and val and val[0] is not None:
+                                members.append(float(val[0]))
+
+                        # Ensemble members: variable_member01_model, variable_member02_model, etc.
+                        # Or: variable_model_member01 format
+                        for key, val in daily.items():
+                            if not key.startswith(variable):
+                                continue
+                            if "member" not in key:
+                                continue
+                            if model not in key:
+                                continue
+                            if isinstance(val, list) and val and val[0] is not None:
+                                members.append(float(val[0]))
+
+                        # Also try format: temperature_2m_max_member01 (single-model response)
+                        if not members:
+                            for key, val in daily.items():
+                                if key.startswith(f"{variable}_member"):
+                                    if isinstance(val, list) and val and val[0] is not None:
+                                        members.append(float(val[0]))
+
+                        if members:
+                            ensemble_data[model] = members
+                            print(f"  V5 Ensemble {self.station_id}/{model}: {len(members)} members")
+
+            elif resp.status_code == 429:
+                print(f"  V5 Ensemble RATE LIMITED (429) for {self.station_id}")
+                WeatherEngine._global_rate_limited = True
+                WeatherEngine._global_rate_limit_until = time.time() + 120
+                return {}
+            else:
+                print(f"  V5 Ensemble API error {resp.status_code} for {self.station_id}")
+
+            time.sleep(1.0)
+
+        except Exception as e:
+            print(f"  V5 Ensemble fetch failed for {self.station_id}: {e}")
+
+        # Cache results
+        if ensemble_data:
+            WeatherEngine._ensemble_cache[cache_key] = ensemble_data
+            WeatherEngine._ensemble_cache_time[cache_key] = time.time()
+
+        return ensemble_data
+
+    def compute_ensemble_bucket_probabilities(
+        self, ensemble_members: Dict[str, List[float]], bucket_edges: List[float]
+    ) -> Dict[str, float]:
+        """
+        V5: Compute bucket probabilities by directly counting ensemble members.
+
+        This is the PRIMARY V5 method — no Monte Carlo or KDE needed.
+        P(bucket) = (count of members in bucket + 0.5) / (total_members + 0.5 * n_buckets)
+        Uses Laplace smoothing to avoid zero probabilities.
+        """
+        # Collect all member values
+        all_members = []
+        for model, members in ensemble_members.items():
+            all_members.extend(members)
+
+        if not all_members:
+            return {}
+
+        total = len(all_members)
+        is_fahrenheit = self.unit == "fahrenheit"
+
+        # Count members in each bucket (with Laplace smoothing)
+        n_buckets = len(bucket_edges) - 1 + 2  # regular buckets + 2 tails
+        smoothing = 0.5
+
+        bucket_probs = {}
+
+        # Regular buckets
+        for i in range(len(bucket_edges) - 1):
+            low = bucket_edges[i]
+            high = bucket_edges[i + 1]
+            count = sum(1 for v in all_members if low <= v < high)
+            prob = (count + smoothing) / (total + smoothing * n_buckets)
+
+            if is_fahrenheit:
+                label = f"{int(low)}-{int(high - 1)}°F"
+            else:
+                label = f"{int(low)}°C"
+            bucket_probs[label] = prob
+
+        # Low tail
+        low_tail_count = sum(1 for v in all_members if v < bucket_edges[0])
+        low_tail_val = int(bucket_edges[0]) - 1
+        low_tail_label = f"{low_tail_val}°F or below" if is_fahrenheit else f"{low_tail_val}°C or below"
+        bucket_probs[low_tail_label] = (low_tail_count + smoothing) / (total + smoothing * n_buckets)
+
+        # High tail
+        high_tail_count = sum(1 for v in all_members if v >= bucket_edges[-1])
+        high_tail_label = f"{int(bucket_edges[-1])}°F or higher" if is_fahrenheit else f"{int(bucket_edges[-1])}°C or higher"
+        bucket_probs[high_tail_label] = (high_tail_count + smoothing) / (total + smoothing * n_buckets)
+
+        # Normalize to sum to 1
+        total_prob = sum(bucket_probs.values())
+        if total_prob > 0:
+            bucket_probs = {k: v / total_prob for k, v in bucket_probs.items()}
+
+        return bucket_probs
+
+    def fetch_previous_runs(
+        self, target_date: str, variable: str = "temperature_2m_max"
+    ) -> Dict:
+        """
+        V5: Fetch previous model runs to detect forecast drift.
+
+        Calls previous-runs API with past_days=2 to compare what models
+        predicted 2 days ago, 1 day ago, and today for the target date.
+
+        Returns: {
+            "direction": "warmer"|"cooler"|"stable",
+            "magnitude": float (degrees of drift),
+            "consistency": float (0-1, how many models agree on drift direction)
+        }
+        """
+        past_days = getattr(config, 'PREVIOUS_RUNS_DAYS', 2)
+        drift_models = ["ecmwf_ifs025", "gfs_seamless", "icon_seamless"]
+
+        try:
+            # Calculate start_date to include past_days before target
+            target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+            start_date = (target_dt - timedelta(days=past_days)).strftime("%Y-%m-%d")
+
+            params = {
+                "latitude": self.lat,
+                "longitude": self.lon,
+                "daily": variable,
+                "timezone": self.tz,
+                "start_date": start_date,
+                "end_date": target_date,
+                "temperature_unit": self.unit,
+                "past_days": past_days,
+                "models": ",".join(drift_models),
+            }
+            if config.OPEN_METEO_API_KEY:
+                params["apikey"] = config.OPEN_METEO_API_KEY
+
+            resp = requests.get(config.OPEN_METEO_PREVIOUS_RUNS_URL, params=params, timeout=20)
+
+            if resp.status_code != 200:
+                return {"direction": "stable", "magnitude": 0.0, "consistency": 0.0}
+
+            data = resp.json()
+            if "daily" not in data:
+                return {"direction": "stable", "magnitude": 0.0, "consistency": 0.0}
+
+            daily = data["daily"]
+            times = daily.get("time", [])
+
+            # Find the index for the target date
+            target_idx = None
+            for i, t in enumerate(times):
+                if t == target_date:
+                    target_idx = i
+                    break
+
+            if target_idx is None:
+                return {"direction": "stable", "magnitude": 0.0, "consistency": 0.0}
+
+            # Extract per-model forecasts for the target date across model runs
+            model_drifts = []
+            for model in drift_models:
+                model_key = f"{variable}_{model}"
+                if model_key not in daily:
+                    continue
+
+                values = daily[model_key]
+                if not isinstance(values, list) or target_idx >= len(values):
+                    continue
+
+                current_val = values[target_idx]
+                if current_val is None:
+                    continue
+
+                # Compare with earlier values if available (earlier runs)
+                earlier_vals = []
+                for j in range(max(0, target_idx - past_days), target_idx):
+                    if j < len(values) and values[j] is not None:
+                        earlier_vals.append(values[j])
+
+                if earlier_vals:
+                    avg_earlier = sum(earlier_vals) / len(earlier_vals)
+                    drift = current_val - avg_earlier
+                    model_drifts.append(drift)
+
+            if not model_drifts:
+                return {"direction": "stable", "magnitude": 0.0, "consistency": 0.0}
+
+            avg_drift = sum(model_drifts) / len(model_drifts)
+            # Consistency: fraction of models that agree on drift direction
+            if avg_drift > 0:
+                agree_count = sum(1 for d in model_drifts if d > 0)
+            elif avg_drift < 0:
+                agree_count = sum(1 for d in model_drifts if d < 0)
+            else:
+                agree_count = len(model_drifts)
+
+            consistency = agree_count / len(model_drifts) if model_drifts else 0.0
+
+            if abs(avg_drift) < 0.5:
+                direction = "stable"
+            elif avg_drift > 0:
+                direction = "warmer"
+            else:
+                direction = "cooler"
+
+            result = {
+                "direction": direction,
+                "magnitude": abs(avg_drift),
+                "consistency": consistency,
+            }
+            print(f"  V5 Drift {self.station_id}: {direction} by {abs(avg_drift):.1f}° "
+                  f"(consistency: {consistency:.0%})")
+            return result
+
+        except Exception as e:
+            print(f"  V5 Previous runs failed for {self.station_id}: {e}")
+            return {"direction": "stable", "magnitude": 0.0, "consistency": 0.0}
+
+    def calibrate_v5(self, lookback_days: int = 60) -> Dict:
+        """
+        V5: Calibration using Historical Forecast API.
+
+        Computes per-model bias and RMSE over last 60 days,
+        plus ensemble calibration percentile data.
+        Saves to disk as JSON for persistence between restarts.
+        """
+        end_date = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+        print(f"  V5 Calibrating {self.station_id} ({start_date} to {end_date})...")
+
+        try:
+            # Fetch actuals
+            actuals = self.fetch_historical_actuals(start_date, end_date)
+            if actuals.empty or len(actuals) < 20:
+                print(f"  V5 Calibration: insufficient actuals for {self.station_id}")
+                return {}
+
+            # Fetch historical forecasts
+            forecasts = self.fetch_historical_forecasts(start_date, end_date)
+            if forecasts.empty:
+                print(f"  V5 Calibration: no historical forecasts for {self.station_id}")
+                return {}
+
+            merged = actuals.merge(forecasts, on="date", how="inner").dropna()
+            if len(merged) < 20:
+                print(f"  V5 Calibration: too few matched days ({len(merged)}) for {self.station_id}")
+                return {}
+
+            # Compute per-model stats
+            v5_cal = {}
+            forecast_cols = [c for c in merged.columns if c.startswith("forecast_")]
+
+            for col in forecast_cols:
+                model_name = col.replace("forecast_", "")
+                errors = merged["actual"] - merged[col]
+                valid = errors.dropna()
+
+                if len(valid) < 10:
+                    continue
+
+                v5_cal[model_name] = {
+                    "bias": float(valid.mean()),
+                    "rmse": float(np.sqrt((valid ** 2).mean())),
+                    "mae": float(valid.abs().mean()),
+                    "std": float(valid.std()),
+                    "n_samples": len(valid),
+                }
+                print(f"  V5 {self.station_id}/{model_name}: "
+                      f"bias={v5_cal[model_name]['bias']:.2f}, "
+                      f"RMSE={v5_cal[model_name]['rmse']:.2f}")
+
+            # Store calibration
+            self.v5_calibration = v5_cal
+
+            # Also update regular error_distributions for compatibility
+            for model_name, cal in v5_cal.items():
+                self.error_distributions[model_name] = {
+                    "mean_bias": cal["bias"],
+                    "std": cal["std"],
+                    "mae": cal["mae"],
+                    "rmse": cal["rmse"],
+                    "percentile_5": -2 * cal["std"],
+                    "percentile_95": 2 * cal["std"],
+                    "n_samples": cal["n_samples"],
+                }
+
+            # Update model weights based on V5 calibration
+            self._update_model_weights()
+
+            # Save to disk for persistence
+            os.makedirs(config.DATA_DIR, exist_ok=True)
+            cal_path = os.path.join(config.DATA_DIR, f"v5_calibration_{self.station_id}.json")
+            with open(cal_path, "w") as f:
+                json.dump(v5_cal, f, indent=2)
+            print(f"  V5 Calibration saved to {cal_path}")
+
+            return v5_cal
+
+        except Exception as e:
+            print(f"  V5 Calibration failed for {self.station_id}: {e}")
+            return {}
+
+    def compute_probability_distribution_v5(
+        self,
+        ensemble_data: Dict[str, List[float]],
+        bucket_edges: List[float],
+        drift_info: Optional[Dict] = None,
+    ) -> Dict[str, float]:
+        """
+        V5: Compute probability distribution using ensemble member counting.
+
+        PRIMARY: Direct member counting from 82+ ensemble scenarios
+        CORRECTION: Apply bias correction from v5_calibration
+        ADJUSTMENT: Shift distribution if drift_info shows consistent trend
+        FALLBACK: If ensemble unavailable, falls back to V4 Monte Carlo
+
+        Returns bucket probabilities in same format as V4 methods.
+        """
+        if not ensemble_data:
+            return {}
+
+        # Step 1: Apply bias correction to ensemble members
+        corrected_data = {}
+        v5_cal = getattr(self, 'v5_calibration', {})
+
+        for model, members in ensemble_data.items():
+            bias = 0.0
+            # Look up bias from V5 calibration
+            if model in v5_cal:
+                bias = v5_cal[model].get("bias", 0.0)
+            elif model in self.error_distributions:
+                bias = self.error_distributions[model].get("mean_bias", 0.0)
+
+            # Correct each member by subtracting the model's bias
+            corrected = [m - bias for m in members]
+            corrected_data[model] = corrected
+
+        # Step 2: Apply drift adjustment if consistent
+        if drift_info and drift_info.get("consistency", 0) > 0.6:
+            drift_mag = drift_info.get("magnitude", 0)
+            drift_dir = drift_info.get("direction", "stable")
+            if drift_dir == "warmer" and drift_mag > 0.5:
+                shift = drift_mag * 0.3  # Apply 30% of drift as shift
+                for model in corrected_data:
+                    corrected_data[model] = [m + shift for m in corrected_data[model]]
+            elif drift_dir == "cooler" and drift_mag > 0.5:
+                shift = drift_mag * 0.3
+                for model in corrected_data:
+                    corrected_data[model] = [m - shift for m in corrected_data[model]]
+
+        # Step 3: Compute bucket probabilities via member counting
+        bucket_probs = self.compute_ensemble_bucket_probabilities(corrected_data, bucket_edges)
+
+        return bucket_probs
+
+    def calibrate(self, lookback_years: int = None) -> Dict:
+        """
+        Build calibration model. V5: tries calibrate_v5 first if API key is set.
+        Falls back to V4 historical calibration.
+        """
+        # V5: Use Pro API calibration if available
+        if config.OPEN_METEO_API_KEY:
+            v5_result = self.calibrate_v5()
+            if v5_result:
+                # Also load persisted V5 calibration data if available
+                cal_path = os.path.join(config.DATA_DIR, f"v5_calibration_{self.station_id}.json")
+                if os.path.exists(cal_path):
+                    try:
+                        with open(cal_path) as f:
+                            self.v5_calibration = json.load(f)
+                    except Exception:
+                        pass
+                return v5_result
+
+        # V4 fallback: original calibration
+        return self._calibrate_v4(lookback_years)
+
+    def _calibrate_v4(self, lookback_years: int = None) -> Dict:
+        """V4 calibration (original method, kept as fallback)."""
+        if lookback_years is None:
+            lookback_years = config.CALIBRATION_YEARS
+
+        end_date = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=365 * lookback_years)).strftime("%Y-%m-%d")
+
+        print(f"  Calibrating {self.station_id} from {start_date} to {end_date}...")
+
+        # Fetch actual data
+        actuals = self.fetch_historical_actuals(start_date, end_date)
+        print(f"  Loaded {len(actuals)} days of actual data")
+
+        # Fetch historical forecast data
+        forecasts = self.fetch_historical_forecasts(start_date, end_date)
+        print(f"  Loaded historical forecasts with {len(forecasts)} days")
+
+        if forecasts.empty or actuals.empty:
+            print("  Warning: Insufficient data for calibration, using defaults")
+            return self._default_calibration()
+
+        # Merge
+        merged = actuals.merge(forecasts, on="date", how="inner")
+        merged = merged.dropna()
+        print(f"  Merged dataset: {len(merged)} days")
+
+        if len(merged) < 30:
+            print("  Warning: Too few matched days, using defaults")
+            return self._default_calibration()
+
+        # Compute error distributions per model
+        calibration_stats = {}
+        forecast_cols = [c for c in merged.columns if c.startswith("forecast_")]
+
+        for col in forecast_cols:
+            model_name = col.replace("forecast_", "")
+            errors = merged["actual"] - merged[col]
+            valid_errors = errors.dropna()
+
+            if len(valid_errors) < 20:
+                continue
+
+            error_stats = {
+                "mean_bias": float(valid_errors.mean()),
+                "std": float(valid_errors.std()),
+                "mae": float(valid_errors.abs().mean()),
+                "rmse": float(np.sqrt((valid_errors ** 2).mean())),
+                "percentile_5": float(valid_errors.quantile(0.05)),
+                "percentile_95": float(valid_errors.quantile(0.95)),
+                "n_samples": len(valid_errors),
+            }
+            self.error_distributions[model_name] = error_stats
+            calibration_stats[model_name] = error_stats
+            print(f"  {model_name}: bias={error_stats['mean_bias']:.2f}°F, "
+                  f"RMSE={error_stats['rmse']:.2f}°F, MAE={error_stats['mae']:.2f}°F")
+
+        # Update model weights based on inverse RMSE
+        self._update_model_weights()
+
+        # Store for probability computation
+        self.historical_data = merged
+        self.calibration_model = calibration_stats
+
+        return calibration_stats
 
 
 class PrecipitationEngine(WeatherEngine):
