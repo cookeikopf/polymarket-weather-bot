@@ -263,10 +263,10 @@ TEMP_BUCKET_SIZE_F = 2
 # Buy YES shares in 3-5 buckets centered on the ensemble temperature median
 # Only buy at LOW prices → massive asymmetric payout if correct
 LADDER_ENABLED = True
-LADDER_MAX_ENTRY_PRICE = 0.22   # V5-optimized: buy shares priced < $0.22 (was 0.20)
-LADDER_BUCKETS = 3              # V5-optimized: 3 focused buckets (was 5) — tighter = higher win rate
-LADDER_BET_PER_BUCKET = 1.5     # V5-optimized: $1.50 per bucket (was $2) — smaller bets, less drawdown
-LADDER_MAX_SETS_PER_CYCLE = 1   # V5-optimized: 1 set per cycle (was 3) — quality over quantity
+LADDER_MAX_ENTRY_PRICE = 0.20   # V5-final: sweet spot for asymmetric payoff
+LADDER_BUCKETS = 3              # V5-final: 3 focused buckets near ensemble median
+LADDER_BET_PER_BUCKET = 2.0     # V5-final: $2 per bucket
+LADDER_MAX_SETS_PER_CYCLE = 1   # V5-final: 1 set per cycle — quality over quantity
 
 # ═══════════════════════════════════════════════════════════════════
 # STRATEGY 2: CONSERVATIVE BUY_NO (steady income)
@@ -275,7 +275,7 @@ ALLOW_BUY_YES = True    # V4: YES enabled for ladder strategy
 ALLOW_BUY_NO = True     # Conservative NO arm
 
 # Conservative NO: only at high entry (= high probability we win)
-CONSERVATIVE_NO_MIN_ENTRY = 0.55  # V5-optimized: 55% entry (was 65%) — catches more opportunities
+CONSERVATIVE_NO_MIN_ENTRY = 0.55  # V5-final: 55% entry — wide net for NO opportunities
 CONSERVATIVE_NO_MAX_ENTRY = 0.85  # Avoid near-certain (low payout)
 
 # Legacy (used by conservative NO arm)
@@ -287,7 +287,7 @@ MAX_ENTRY_PRICE = 0.85   # For BUY_NO strategy
 # ═══════════════════════════════════════════════════════════════════
 # Minimum edge for CONSERVATIVE NO trades
 # Ladder trades don't require edge — they rely on forecast accuracy
-MIN_EDGE_PCT = 0.10  # V5-optimized: 10% minimum edge (was 8%) — higher quality trades
+MIN_EDGE_PCT = 0.12  # V5-final: 12% minimum edge — highest Sharpe ratio in optimization
 
 # Minimum absolute probability for a bucket to be tradeable
 MIN_PROBABILITY = 0.02  # 2% — ladder buys low-prob buckets by design
@@ -302,7 +302,7 @@ MIN_ENSEMBLE_AGREEMENT = 0.45  # 45% — slightly relaxed for more ladder opport
 KELLY_FRACTION = 0.15  # V5-optimized: 15% Kelly confirmed optimal
 
 # Maximum position size as fraction of bankroll
-MAX_POSITION_PCT = 0.15  # V5-optimized: 15% per trade (was 5%) — backed by 8.5% max drawdown
+MAX_POSITION_PCT = 0.15  # V5-final: 15% per trade — backed by 12.6% max drawdown in backtest
 
 # Maximum number of concurrent positions
 MAX_CONCURRENT_POSITIONS = 25  # 3 ladder sets × 5 buckets + NO trades
@@ -412,6 +412,52 @@ WU_STATIONS = {
     "Lucknow":      {"wu": "VILK:9:IN", "units": "m"},
     "Wellington":   {"wu": "NZWN:9:NZ", "units": "m"},
 }
+
+# ═══════════════════════════════════════════════════════════════════
+# V5 ADVANCED INNOVATIONS
+# ═══════════════════════════════════════════════════════════════════
+
+# Innovation 1: Bias-Corrected Ensemble
+CALIBRATION_DATA_DIR = "data"  # Directory containing v5_calibration_{station}.json
+
+# Innovation 2: Ensemble Spread Confidence
+ENSEMBLE_SPREAD_LOW_STD = 2.5     # Below this → high confidence (1.8x sizing)
+ENSEMBLE_SPREAD_HIGH_STD = 5.0    # Above this → low confidence (0.6x sizing, was 0.5x)
+ENSEMBLE_HIGH_CONF_MULTIPLIER = 1.5
+ENSEMBLE_LOW_CONF_MULTIPLIER = 0.5
+
+# Innovation 3: Precipitation Adjustment
+PRECIP_HEAVY_THRESHOLD_MM = 5.0   # >5mm = heavy precipitation
+PRECIP_HEAVY_MEMBER_PCT = 0.70    # >70% of members must agree
+PRECIP_TEMP_ADJUSTMENT_F = 1.5    # Adjust temp down by 1.5°F when heavy rain
+PRECIP_DRY_THRESHOLD_MM = 1.0     # <1mm = dry
+PRECIP_DRY_MEMBER_PCT = 0.70      # >70% of members must be dry
+PRECIP_DRY_TEMP_ADJUSTMENT_F = 0.5  # Slight upward adjustment when dry
+
+# Innovation 4: Inter-Model Disagreement
+MODEL_DISAGREEMENT_THRESHOLD_F = 6.0  # >6°F spread = disagreement (was 4°F — too trigger-happy)
+MODEL_AGREEMENT_THRESHOLD_F = 3.0     # <3°F spread = agreement (was 2°F — too strict)
+DISAGREEMENT_SIZING_MULTIPLIER = 0.7  # Only mild reduction (was 0.5x — too harsh)
+AGREEMENT_SIZING_MULTIPLIER = 1.8     # Strong boost on agreement (was 1.3x)
+
+# Innovation 5: Time-Decay
+TIME_DECAY_FULL_CONF_DAYS = 2     # 0-2 days: full confidence (was 1 — 2-day forecasts are still good)
+TIME_DECAY_MED_CONF_DAYS = 4      # 3-4 days: 0.8x sizing
+TIME_DECAY_MED_MULTIPLIER = 0.8
+TIME_DECAY_FAR_MULTIPLIER = 0.5   # 5+ days: 0.5x sizing (was 0.4x)
+TIME_DECAY_FAR_MIN_EDGE = 0.20    # Skip trades with edge < 20% at 5+ days
+
+# Innovation 6: Market Efficiency Scoring
+MARKET_SHARP_THRESHOLD = 0.03     # |sum - 1.05| < 0.03 → sharp market
+MARKET_SOFT_THRESHOLD = 0.10      # |sum - 1.05| > 0.10 → soft market
+MARKET_SHARP_EDGE_MULTIPLIER = 1.5  # Require 1.5x edge in sharp markets
+MARKET_EXPECTED_SUM = 1.05        # Expected sum of YES prices
+
+# Innovation 7: Dynamic Ladder Width + Bimodal Detection
+BIMODAL_GAP_THRESHOLD_F = 4.0     # Min gap between clusters for bimodal detection
+BIMODAL_VALLEY_MAX_DENSITY = 0.03  # Max density in valley to confirm bimodal
+NARROW_PEAK_STD_F = 2.0           # Unimodal narrow: std < 2°F → 2-bucket ladder
+WIDE_PEAK_STD_F = 4.0             # Unimodal wide: std > 4°F → 3-4 bucket ladder
 
 # ML Model
 ML_MODEL_PATH = "data/ml_model.pkl"

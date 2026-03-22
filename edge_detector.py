@@ -46,7 +46,15 @@ class TradingSignal:
 
 
 class EdgeDetector:
-    """Detect profitable edges using dual strategy: Ladder + Conservative NO."""
+    """Detect profitable edges using dual strategy: Ladder + Conservative NO.
+
+    V5 Advanced Innovations:
+    - Innovation 2: Ensemble spread confidence scaling
+    - Innovation 4: Inter-model disagreement detection
+    - Innovation 5: Time-decay edge optimization
+    - Innovation 6: Market efficiency scoring
+    - Innovation 7: Dynamic ladder width + bimodal detection
+    """
 
     def __init__(self):
         self.min_edge = config.MIN_EDGE_PCT
@@ -70,30 +78,175 @@ class EdgeDetector:
         ensemble_stats: Dict,
         bankroll: float,
         current_exposure: float = 0,
+        days_to_resolution: float = 1.0,
     ) -> List[TradingSignal]:
         """
-        Find trading opportunities using both strategies.
+        Find trading opportunities using both strategies + all 7 V5 innovations.
         Returns combined list of signals sorted by expected value.
         """
         signals = []
 
+        # Innovation 6: Market Efficiency Scoring
+        market_efficiency = self._compute_market_efficiency(market)
+        effective_min_edge = self.min_edge
+        if market_efficiency == "sharp":
+            multiplier = getattr(config, 'MARKET_SHARP_EDGE_MULTIPLIER', 1.5)
+            effective_min_edge = self.min_edge * multiplier
+
+        # Innovation 2: Ensemble Spread Confidence
+        spread_multiplier = self._compute_spread_multiplier(ensemble_stats)
+
+        # Innovation 4: Inter-Model Disagreement
+        disagreement_info = self._compute_model_disagreement(ensemble_stats)
+
+        # Innovation 5: Time-Decay
+        time_decay_multiplier = self._compute_time_decay(
+            days_to_resolution, ensemble_stats
+        )
+
+        # Innovation 7: Dynamic Ladder Width
+        dynamic_buckets = self._compute_dynamic_ladder_width(ensemble_stats)
+
+        # Combined sizing multiplier
+        sizing_multiplier = spread_multiplier * disagreement_info["sizing_multiplier"] * time_decay_multiplier
+
         # ─── STRATEGY 1: LADDER (BUY_YES around ensemble median) ───
         ladder_signals = self._find_ladder_signals(
-            market, our_probabilities, ensemble_stats, bankroll, current_exposure
+            market, our_probabilities, ensemble_stats, bankroll, current_exposure,
+            sizing_multiplier=sizing_multiplier,
+            dynamic_buckets=dynamic_buckets,
         )
         signals.extend(ladder_signals)
+
+        # ─── Innovation 7: BIMODAL strategy ───
+        if ensemble_stats.get("is_bimodal", False):
+            bimodal_signals = self._find_bimodal_signals(
+                market, our_probabilities, ensemble_stats, bankroll, current_exposure,
+                sizing_multiplier=sizing_multiplier,
+            )
+            signals.extend(bimodal_signals)
 
         # ─── STRATEGY 2: CONSERVATIVE BUY_NO ───
         if getattr(config, 'ALLOW_BUY_NO', True):
             no_signals = self._find_conservative_no_signals(
-                market, our_probabilities, ensemble_stats, bankroll, current_exposure
+                market, our_probabilities, ensemble_stats, bankroll, current_exposure,
+                effective_min_edge=effective_min_edge,
+                sizing_multiplier=sizing_multiplier,
+                disagreement_day=disagreement_info["is_disagreement"],
             )
             signals.extend(no_signals)
+
+        # Innovation 4: On disagreement days, add conservative NO on extremes
+        if disagreement_info["is_disagreement"]:
+            extreme_no_signals = self._find_disagreement_no_signals(
+                market, our_probabilities, ensemble_stats, bankroll, current_exposure,
+            )
+            signals.extend(extreme_no_signals)
+
+        # Innovation 5: Filter low-edge trades at long horizons
+        if days_to_resolution >= getattr(config, 'TIME_DECAY_MED_CONF_DAYS', 3) + 1:
+            far_min_edge = getattr(config, 'TIME_DECAY_FAR_MIN_EDGE', 0.15)
+            signals = [s for s in signals if s.edge_pct >= far_min_edge or s.strategy == "bimodal"]
 
         # Sort by EV * confidence
         signals.sort(key=lambda s: s.expected_value * s.confidence, reverse=True)
 
         return signals
+
+    # ─── Innovation 2: Ensemble Spread Confidence ───
+    def _compute_spread_multiplier(self, ensemble_stats: Dict) -> float:
+        """Scale position sizes based on ensemble spread (std)."""
+        member_std = ensemble_stats.get("member_std", ensemble_stats.get("std", 3.0))
+        low_std = getattr(config, 'ENSEMBLE_SPREAD_LOW_STD', 2.0)
+        high_std = getattr(config, 'ENSEMBLE_SPREAD_HIGH_STD', 4.0)
+        high_mult = getattr(config, 'ENSEMBLE_HIGH_CONF_MULTIPLIER', 1.5)
+        low_mult = getattr(config, 'ENSEMBLE_LOW_CONF_MULTIPLIER', 0.5)
+
+        if member_std < low_std:
+            return high_mult
+        elif member_std > high_std:
+            return low_mult
+        else:
+            # Linear interpolation between high and low
+            frac = (member_std - low_std) / (high_std - low_std)
+            return high_mult + frac * (low_mult - high_mult)
+
+    # ─── Innovation 4: Inter-Model Disagreement ───
+    def _compute_model_disagreement(self, ensemble_stats: Dict) -> Dict:
+        """Detect inter-model disagreement from per-model medians."""
+        per_model_medians = ensemble_stats.get("per_model_medians", {})
+        if len(per_model_medians) < 2:
+            return {"is_disagreement": False, "is_agreement": False,
+                    "model_spread": 0, "sizing_multiplier": 1.0}
+
+        medians = list(per_model_medians.values())
+        model_spread = max(medians) - min(medians)
+        disagree_thresh = getattr(config, 'MODEL_DISAGREEMENT_THRESHOLD_F', 4.0)
+        agree_thresh = getattr(config, 'MODEL_AGREEMENT_THRESHOLD_F', 2.0)
+
+        is_disagreement = model_spread > disagree_thresh
+        is_agreement = model_spread < agree_thresh
+
+        if is_disagreement:
+            sizing_mult = getattr(config, 'DISAGREEMENT_SIZING_MULTIPLIER', 0.5)
+        elif is_agreement:
+            sizing_mult = getattr(config, 'AGREEMENT_SIZING_MULTIPLIER', 1.3)
+        else:
+            sizing_mult = 1.0
+
+        return {
+            "is_disagreement": is_disagreement,
+            "is_agreement": is_agreement,
+            "model_spread": model_spread,
+            "sizing_multiplier": sizing_mult,
+        }
+
+    # ─── Innovation 5: Time-Decay ───
+    def _compute_time_decay(self, days_to_resolution: float, ensemble_stats: Dict) -> float:
+        """Calculate time-decay sizing multiplier."""
+        full_days = getattr(config, 'TIME_DECAY_FULL_CONF_DAYS', 1)
+        med_days = getattr(config, 'TIME_DECAY_MED_CONF_DAYS', 3)
+        med_mult = getattr(config, 'TIME_DECAY_MED_MULTIPLIER', 0.7)
+        far_mult = getattr(config, 'TIME_DECAY_FAR_MULTIPLIER', 0.4)
+
+        if days_to_resolution <= full_days:
+            return 1.0
+        elif days_to_resolution <= med_days:
+            return med_mult
+        else:
+            return far_mult
+
+    # ─── Innovation 6: Market Efficiency Scoring ───
+    def _compute_market_efficiency(self, market: WeatherMarket) -> str:
+        """Score market as 'sharp', 'soft', or 'normal'."""
+        prices_sum = sum(o.price for o in market.outcomes if o.price > 0)
+        expected_sum = getattr(config, 'MARKET_EXPECTED_SUM', 1.05)
+        sharp_thresh = getattr(config, 'MARKET_SHARP_THRESHOLD', 0.03)
+        soft_thresh = getattr(config, 'MARKET_SOFT_THRESHOLD', 0.10)
+
+        deviation = abs(prices_sum - expected_sum)
+        if deviation < sharp_thresh:
+            return "sharp"
+        elif deviation > soft_thresh:
+            return "soft"
+        return "normal"
+
+    # ─── Innovation 7: Dynamic Ladder Width ───
+    def _compute_dynamic_ladder_width(self, ensemble_stats: Dict) -> int:
+        """Determine number of ladder buckets based on ensemble shape."""
+        if ensemble_stats.get("is_bimodal", False):
+            return 0  # Bimodal uses separate strategy
+
+        member_std = ensemble_stats.get("member_std", ensemble_stats.get("std", 3.0))
+        narrow_std = getattr(config, 'NARROW_PEAK_STD_F', 2.0)
+        wide_std = getattr(config, 'WIDE_PEAK_STD_F', 4.0)
+
+        if member_std < narrow_std:
+            return 2  # Tight ladder
+        elif member_std > wide_std:
+            return 4  # Wide ladder
+        else:
+            return 3  # Standard ladder
 
     def _find_ladder_signals(
         self,
@@ -102,35 +255,29 @@ class EdgeDetector:
         ensemble_stats: Dict,
         bankroll: float,
         current_exposure: float,
+        sizing_multiplier: float = 1.0,
+        dynamic_buckets: Optional[int] = None,
     ) -> List[TradingSignal]:
         """
-        LADDER STRATEGY: Buy YES shares in 3-5 buckets around the ensemble median.
+        LADDER STRATEGY: Buy YES shares in N buckets around the ensemble median.
 
-        Logic:
-        1. Get ensemble median temperature forecast
-        2. Find the market bucket that contains this median
-        3. Buy YES in this bucket + adjacent buckets (the "ladder")
-        4. Only buy if market price is LOW (< $0.20) = massive upside if correct
-        5. 1 correct bucket → $1/share payout → huge return on 5-15 cent investment
-
-        Why this works:
-        - 1-day NWP forecasts are 85-90% accurate (within a few degrees)
-        - Market often underprices the most-likely bucket
-        - Payout asymmetry: 700-1900% return on winning bucket vs small loss on losers
+        Innovation 2: sizing_multiplier from ensemble spread confidence.
+        Innovation 7: dynamic_buckets from ensemble shape analysis.
         """
         signals = []
 
-        # Get ensemble median
-        ensemble_mean = ensemble_stats.get("mean", None)
+        # Get ensemble median (prefer member median if available)
+        ensemble_mean = ensemble_stats.get("median", ensemble_stats.get("mean", None))
         if ensemble_mean is None:
             return signals
+
+        # Innovation 7: Use dynamic bucket count if provided
+        n_buckets = dynamic_buckets if dynamic_buckets and dynamic_buckets > 0 else self.ladder_buckets
 
         # Determine temperature unit
         station = config.STATIONS.get(market.station_id, {})
         is_fahrenheit = station.get("unit", "fahrenheit") == "fahrenheit"
 
-        # Find which outcomes are near the ensemble median
-        # and score each by distance from median + market price
         import re
         candidates = []
 
@@ -141,23 +288,16 @@ class EdgeDetector:
 
             market_price = outcome.price
             if market_price < 0 or market_price > self.ladder_max_price:
-                continue  # Only buy cheap shares
+                continue
 
-            # Skip outcomes with no CLOB data
             if market_price <= 0.005:
                 continue
 
-            # Determine the temperature value for this bucket
             bucket_temp = self._extract_bucket_temp(outcome.name, is_fahrenheit)
             if bucket_temp is None:
                 continue
 
-            # Distance from ensemble median (in degrees)
             dist = abs(bucket_temp - ensemble_mean)
-
-            # Score: prefer buckets close to median AND with low market price
-            # Close to median → high chance of hitting
-            # Low price → high payout multiplier
             candidates.append({
                 "outcome": outcome,
                 "our_prob": our_prob,
@@ -169,20 +309,12 @@ class EdgeDetector:
         if not candidates:
             return signals
 
-        # Sort by distance from median (closest first)
         candidates.sort(key=lambda c: c["dist_from_median"])
-
-        # Take top N closest to median (the ladder)
-        ladder = candidates[:self.ladder_buckets]
+        ladder = candidates[:n_buckets]
 
         if not ladder:
             return signals
 
-        # Calculate combined ladder statistics
-        total_cost = sum(c["market_price"] for c in ladder)
-        total_prob_hit = sum(c["our_prob"] for c in ladder)  # prob at least one hits
-
-        # Confidence from ensemble agreement
         agreement = ensemble_stats.get("agreement", 0.5)
         n_models = ensemble_stats.get("n_models", 1)
 
@@ -191,38 +323,29 @@ class EdgeDetector:
             our_prob = c["our_prob"]
             market_price = c["market_price"]
 
-            # Use CLOB spread-aware prices if available
             clob_ask = getattr(outcome, '_clob_ask', None)
             entry_price = clob_ask if clob_ask else market_price
 
             if entry_price <= 0 or entry_price >= 1:
                 continue
 
-            # Edge: our probability minus what we pay
             edge = our_prob - entry_price
-
-            # For ladder strategy, we don't require positive edge on each bucket
-            # The COMBINED ladder has positive EV because the winning bucket pays 700%+
-            # But skip if our model gives 0% probability
             if our_prob < 0.01:
                 continue
 
-            # Expected value for this single bucket (standalone)
-            win_pnl = (1.0 - entry_price)  # payout per share if correct
-            loss_pnl = entry_price  # cost per share if wrong
+            win_pnl = (1.0 - entry_price)
+            loss_pnl = entry_price
             ev_per_share = our_prob * win_pnl - (1 - our_prob) * loss_pnl
             ev_per_dollar = ev_per_share / entry_price
 
-            # Confidence: higher if models agree and bucket is close to median
             dist = c["dist_from_median"]
-            max_dist = (4 if is_fahrenheit else 2)  # reasonable ladder width
+            max_dist = (4 if is_fahrenheit else 2)
             proximity_score = max(0, 1.0 - dist / (max_dist * 2))
             confidence = (0.40 * agreement + 0.30 * proximity_score + 0.30 * min(1.0, n_models / 5))
 
-            # Position size: fixed per ladder bucket
-            suggested_size = self.ladder_bet_per_bucket
+            # Innovation 2+4+5: Apply combined sizing multiplier
+            suggested_size = self.ladder_bet_per_bucket * sizing_multiplier
 
-            # Check remaining capacity
             remaining = (bankroll * config.MAX_TOTAL_EXPOSURE) - current_exposure
             if remaining < suggested_size:
                 continue
@@ -232,6 +355,7 @@ class EdgeDetector:
                 f"Distance from median: {dist:.1f}° | Market price: {market_price:.3f}",
                 f"Our probability: {our_prob:.1%} | Payout if correct: {1.0/entry_price:.0f}x",
                 f"Ensemble: {n_models} models, agreement {agreement:.1%}",
+                f"Sizing multiplier: {sizing_multiplier:.2f}x | Ladder width: {n_buckets} buckets",
             ]
 
             if dist <= (2 if is_fahrenheit else 1):
@@ -248,7 +372,7 @@ class EdgeDetector:
                 edge_pct=abs(edge) / max(market_price, 0.01),
                 confidence=confidence,
                 direction="BUY_YES",
-                kelly_fraction=0,  # Fixed sizing for ladder
+                kelly_fraction=0,
                 suggested_size_usd=suggested_size,
                 expected_value=ev_per_dollar,
                 reasons=reasons,
@@ -264,12 +388,17 @@ class EdgeDetector:
         ensemble_stats: Dict,
         bankroll: float,
         current_exposure: float,
+        effective_min_edge: float = None,
+        sizing_multiplier: float = 1.0,
+        disagreement_day: bool = False,
     ) -> List[TradingSignal]:
         """
         CONSERVATIVE BUY_NO: Buy NO on outcomes that are unlikely.
-        Only at high entry prices (= high NO probability = safe bets).
+        Innovation 4: On disagreement days, prioritize conservative NO trades.
+        Innovation 6: Use effective_min_edge (higher for sharp markets).
         """
         signals = []
+        min_edge = effective_min_edge if effective_min_edge is not None else self.min_edge
 
         for outcome in market.outcomes:
             our_prob = self._match_probability(outcome.name, our_probabilities)
@@ -280,35 +409,28 @@ class EdgeDetector:
             if market_price < 0:
                 continue
 
-            # Use spread-aware prices
             clob_ask = getattr(outcome, '_clob_ask', None)
             clob_bid = getattr(outcome, '_clob_bid', None)
 
-            # BUY_NO: we bet that this outcome does NOT happen
-            # Entry price for NO = 1 - bid (what we pay for NO shares)
             if clob_bid:
                 entry_price_no = 1.0 - clob_bid
             else:
                 entry_price_no = 1.0 - market_price
 
-            # Conservative NO filter: only high-entry (high probability of NO winning)
             if entry_price_no < self.conservative_no_min_entry:
                 continue
             if entry_price_no > self.conservative_no_max_entry:
                 continue
 
-            # Edge calculation
-            our_prob_no = 1.0 - our_prob  # our probability of NO
+            our_prob_no = 1.0 - our_prob
             if clob_bid:
                 edge = our_prob_no - entry_price_no
             else:
                 edge = (1.0 - our_prob) - (1.0 - market_price)
 
-            # Require minimum edge
-            if edge < self.min_edge:
+            if edge < min_edge:
                 continue
 
-            # Confidence
             agreement = ensemble_stats.get("agreement", 0.5)
             n_models = ensemble_stats.get("n_models", 1)
             model_std = ensemble_stats.get("std", 5.0)
@@ -319,23 +441,26 @@ class EdgeDetector:
             if confidence < config.MIN_ENSEMBLE_AGREEMENT:
                 continue
 
-            # EV
-            win_pnl = 1.0 - entry_price_no  # payout per share
+            win_pnl = 1.0 - entry_price_no
             loss_pnl = entry_price_no
             ev_per_share = our_prob_no * win_pnl - (1 - our_prob_no) * loss_pnl
             ev_per_dollar = ev_per_share / entry_price_no
 
-            # Position sizing via Kelly
             kelly_frac = self._kelly_criterion(our_prob_no, entry_price_no)
             suggested_size = self._compute_position_size(
                 kelly_frac, bankroll, current_exposure, confidence, entry_price_no
             )
+            # Apply innovation multipliers
+            suggested_size *= sizing_multiplier
 
             reasons = [
                 f"CONSERVATIVE NO: {outcome.name} unlikely (our P(NO)={our_prob_no:.1%})",
                 f"Entry NO: {entry_price_no:.3f} | Edge: {edge:.1%}",
                 f"Ensemble: {ensemble_stats.get('n_models', 0)} models, agreement {agreement:.1%}",
+                f"Sizing multiplier: {sizing_multiplier:.2f}x",
             ]
+            if disagreement_day:
+                reasons.append("DISAGREEMENT DAY: Conservative NO prioritized")
 
             signals.append(TradingSignal(
                 market=market,
@@ -351,6 +476,197 @@ class EdgeDetector:
                 expected_value=ev_per_dollar,
                 reasons=reasons,
                 strategy="conservative_no",
+            ))
+
+        return signals
+
+    # ─── Innovation 7: Bimodal Strategy ───
+    def _find_bimodal_signals(
+        self,
+        market: WeatherMarket,
+        our_probabilities: Dict[str, float],
+        ensemble_stats: Dict,
+        bankroll: float,
+        current_exposure: float,
+        sizing_multiplier: float = 1.0,
+    ) -> List[TradingSignal]:
+        """
+        Innovation 7: When ensemble is bimodal, buy YES on both peaks and NO on valley.
+        """
+        signals = []
+        peaks = ensemble_stats.get("bimodal_peaks", [])
+        if len(peaks) < 2:
+            return signals
+
+        station = config.STATIONS.get(market.station_id, {})
+        is_fahrenheit = station.get("unit", "fahrenheit") == "fahrenheit"
+
+        peak1, peak2 = peaks[0], peaks[1]
+        valley_center = (peak1 + peak2) / 2.0
+
+        for outcome in market.outcomes:
+            our_prob = self._match_probability(outcome.name, our_probabilities)
+            if our_prob is None:
+                continue
+
+            market_price = outcome.price
+            if market_price <= 0.005:
+                continue
+
+            bucket_temp = self._extract_bucket_temp(outcome.name, is_fahrenheit)
+            if bucket_temp is None:
+                continue
+
+            # Buy YES on buckets near peaks (within 2°F)
+            near_peak1 = abs(bucket_temp - peak1) <= 2
+            near_peak2 = abs(bucket_temp - peak2) <= 2
+            near_valley = abs(bucket_temp - valley_center) <= 2 and not near_peak1 and not near_peak2
+
+            if near_peak1 or near_peak2:
+                if market_price > self.ladder_max_price:
+                    continue
+                entry_price = market_price
+                edge = our_prob - entry_price
+                if our_prob < 0.01:
+                    continue
+
+                win_pnl = 1.0 - entry_price
+                ev_per_share = our_prob * win_pnl - (1 - our_prob) * entry_price
+                ev_per_dollar = ev_per_share / entry_price if entry_price > 0 else 0
+
+                size = self.ladder_bet_per_bucket * sizing_multiplier
+                remaining = (bankroll * config.MAX_TOTAL_EXPOSURE) - current_exposure
+                if remaining < size:
+                    continue
+
+                peak_label = "peak1" if near_peak1 else "peak2"
+                signals.append(TradingSignal(
+                    market=market, outcome=outcome,
+                    our_probability=our_prob, market_price=market_price,
+                    edge=max(edge, 0),
+                    edge_pct=abs(edge) / max(market_price, 0.01),
+                    confidence=0.6,
+                    direction="BUY_YES", kelly_fraction=0,
+                    suggested_size_usd=size,
+                    expected_value=ev_per_dollar,
+                    reasons=[
+                        f"BIMODAL {peak_label}: Bucket {outcome.name} near peak {peak1 if near_peak1 else peak2:.1f}°",
+                        f"Bimodal distribution: peaks at {peak1:.1f}° and {peak2:.1f}°",
+                    ],
+                    strategy="bimodal",
+                ))
+
+            elif near_valley and market_price > 0.05:
+                # Buy NO on valley bucket
+                entry_price_no = 1.0 - market_price
+                our_prob_no = 1.0 - our_prob
+                edge = our_prob_no - entry_price_no
+                if edge < self.min_edge:
+                    continue
+
+                win_pnl = 1.0 - entry_price_no
+                ev_per_share = our_prob_no * win_pnl - (1 - our_prob_no) * entry_price_no
+                ev_per_dollar = ev_per_share / entry_price_no if entry_price_no > 0 else 0
+
+                size = self.ladder_bet_per_bucket * sizing_multiplier * 0.5
+                remaining = (bankroll * config.MAX_TOTAL_EXPOSURE) - current_exposure
+                if remaining < size:
+                    continue
+
+                signals.append(TradingSignal(
+                    market=market, outcome=outcome,
+                    our_probability=our_prob, market_price=market_price,
+                    edge=edge,
+                    edge_pct=abs(edge) / max(market_price, 0.01),
+                    confidence=0.55,
+                    direction="BUY_NO", kelly_fraction=0,
+                    suggested_size_usd=size,
+                    expected_value=ev_per_dollar,
+                    reasons=[
+                        f"BIMODAL VALLEY NO: {outcome.name} in valley between peaks",
+                        f"Valley center: {valley_center:.1f}° | Peaks: {peak1:.1f}°, {peak2:.1f}°",
+                    ],
+                    strategy="bimodal",
+                ))
+
+        return signals
+
+    # ─── Innovation 4: Disagreement Day NO Strategy ───
+    def _find_disagreement_no_signals(
+        self,
+        market: WeatherMarket,
+        our_probabilities: Dict[str, float],
+        ensemble_stats: Dict,
+        bankroll: float,
+        current_exposure: float,
+    ) -> List[TradingSignal]:
+        """
+        Innovation 4: On disagreement days, buy NO on extreme tail outcomes.
+        When models disagree, the truth is usually somewhere in the middle.
+        """
+        signals = []
+        per_model_medians = ensemble_stats.get("per_model_medians", {})
+        if not per_model_medians:
+            return signals
+
+        # Find the consensus range (middle zone where 2+ models agree)
+        medians = sorted(per_model_medians.values())
+        consensus_low = medians[0]
+        consensus_high = medians[-1]
+
+        station = config.STATIONS.get(market.station_id, {})
+        is_fahrenheit = station.get("unit", "fahrenheit") == "fahrenheit"
+
+        for outcome in market.outcomes:
+            our_prob = self._match_probability(outcome.name, our_probabilities)
+            if our_prob is None or our_prob > 0.05:
+                continue  # Only target very unlikely outcomes
+
+            market_price = outcome.price
+            if market_price <= 0.005:
+                continue
+
+            bucket_temp = self._extract_bucket_temp(outcome.name, is_fahrenheit)
+            if bucket_temp is None:
+                continue
+
+            # Only target buckets far outside ALL model medians
+            margin = 6.0 if is_fahrenheit else 3.5
+            if consensus_low - margin < bucket_temp < consensus_high + margin:
+                continue  # Not extreme enough
+
+            entry_price_no = 1.0 - market_price
+            if entry_price_no < 0.55 or entry_price_no > 0.90:
+                continue
+
+            our_prob_no = 1.0 - our_prob
+            edge = our_prob_no - entry_price_no
+            if edge < self.min_edge:
+                continue
+
+            win_pnl = 1.0 - entry_price_no
+            ev_per_share = our_prob_no * win_pnl - (1 - our_prob_no) * entry_price_no
+            ev_per_dollar = ev_per_share / entry_price_no if entry_price_no > 0 else 0
+
+            size = min(self.ladder_bet_per_bucket, bankroll * 0.03)
+            remaining = (bankroll * config.MAX_TOTAL_EXPOSURE) - current_exposure
+            if remaining < size or size < 1.0:
+                continue
+
+            signals.append(TradingSignal(
+                market=market, outcome=outcome,
+                our_probability=our_prob, market_price=market_price,
+                edge=edge,
+                edge_pct=abs(edge) / max(market_price, 0.01),
+                confidence=0.5,
+                direction="BUY_NO", kelly_fraction=0,
+                suggested_size_usd=size,
+                expected_value=ev_per_dollar,
+                reasons=[
+                    f"DISAGREEMENT NO: {outcome.name} extreme tail, all models disagree away",
+                    f"Model medians: {[f'{v:.1f}' for v in medians]} | Bucket: {bucket_temp:.1f}°",
+                ],
+                strategy="disagreement_no",
             ))
 
         return signals

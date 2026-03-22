@@ -480,18 +480,28 @@ class WeatherEngine:
 
         return bucket_probs
 
-    def compute_ensemble_stats(self, forecasts: Dict[str, float]) -> Dict:
+    def compute_ensemble_stats(
+        self, forecasts: Dict[str, float],
+        ensemble_members: Optional[Dict[str, List[float]]] = None,
+    ) -> Dict:
         """Compute ensemble statistics for confidence assessment.
 
+        Innovation 2: Enhanced stats including member-level std, skewness, median.
+        Innovation 4: Per-model medians for disagreement detection.
+
         Returns a dict with standardized keys:
-            mean, std, range, spread, agreement, agreement_score,
-            min, max, n_models
+            mean, median, std, range, spread, agreement, agreement_score,
+            min, max, n_models, skewness, per_model_medians,
+            member_std, member_spread, is_bimodal, bimodal_peaks
         """
         if not forecasts:
             return {
-                "mean": 0, "std": 999, "range": 999, "spread": 999,
+                "mean": 0, "median": 0, "std": 999, "range": 999, "spread": 999,
                 "agreement": 0, "agreement_score": 0,
                 "min": 0, "max": 0, "n_models": 0,
+                "skewness": 0, "per_model_medians": {},
+                "member_std": 999, "member_spread": 999,
+                "is_bimodal": False, "bimodal_peaks": [],
             }
 
         values = list(forecasts.values())
@@ -503,20 +513,92 @@ class WeatherEngine:
         model_range = max(values) - min(values)
 
         # Agreement score: 1 - (normalized spread)
-        # If all models agree within 2°F, agreement = 1.0
         agreement = max(0, 1.0 - (model_range / 10.0))
+
+        # Innovation 4: Per-model medians for disagreement detection
+        per_model_medians = {}
+        if ensemble_members:
+            for model, members in ensemble_members.items():
+                if members:
+                    per_model_medians[model] = float(np.median(members))
+
+        # Innovation 2: Member-level statistics (if ensemble members available)
+        all_members = []
+        if ensemble_members:
+            for members in ensemble_members.values():
+                all_members.extend(members)
+
+        member_std = float(np.std(all_members)) if all_members else std
+        member_median = float(np.median(all_members)) if all_members else mean
+        member_spread = float(max(all_members) - min(all_members)) if all_members else model_range
+
+        # Skewness of ensemble distribution
+        skewness = 0.0
+        if all_members and len(all_members) > 3:
+            skewness = float(stats.skew(all_members))
+
+        # Innovation 7: Bimodal detection
+        is_bimodal = False
+        bimodal_peaks = []
+        if all_members and len(all_members) > 20:
+            is_bimodal, bimodal_peaks = self._detect_bimodality(all_members)
 
         return {
             "mean": float(mean),
+            "median": float(member_median),
             "std": float(std),
             "range": float(model_range),
-            "spread": float(model_range),  # alias for range
+            "spread": float(model_range),
             "agreement": float(agreement),
-            "agreement_score": float(agreement),  # alias for agreement
+            "agreement_score": float(agreement),
             "min": float(min(values)),
             "max": float(max(values)),
             "n_models": len(values),
+            "skewness": skewness,
+            "per_model_medians": per_model_medians,
+            "member_std": member_std,
+            "member_spread": member_spread,
+            "is_bimodal": is_bimodal,
+            "bimodal_peaks": bimodal_peaks,
         }
+
+    def _detect_bimodality(self, members: List[float]) -> Tuple[bool, List[float]]:
+        """
+        Innovation 7: Detect bimodal distribution using simple cluster analysis.
+
+        Approach: Sort members, find the largest gap. If gap > threshold and
+        both clusters have sufficient membership, declare bimodal.
+        Returns (is_bimodal, [peak1, peak2]).
+        """
+        sorted_m = np.sort(members)
+        n = len(sorted_m)
+        if n < 20:
+            return False, []
+
+        gap_threshold = getattr(config, 'BIMODAL_GAP_THRESHOLD_F', 4.0)
+        if self.unit != "fahrenheit":
+            gap_threshold = gap_threshold * 5.0 / 9.0
+
+        # Find the largest gap between consecutive sorted members
+        gaps = np.diff(sorted_m)
+        max_gap_idx = np.argmax(gaps)
+        max_gap = gaps[max_gap_idx]
+
+        if max_gap < gap_threshold:
+            return False, []
+
+        # Split into two clusters at the largest gap
+        cluster1 = sorted_m[:max_gap_idx + 1]
+        cluster2 = sorted_m[max_gap_idx + 1:]
+
+        # Both clusters must have at least 15% of total members
+        min_cluster_pct = 0.15
+        if len(cluster1) / n < min_cluster_pct or len(cluster2) / n < min_cluster_pct:
+            return False, []
+
+        peak1 = float(np.median(cluster1))
+        peak2 = float(np.median(cluster2))
+        return True, [peak1, peak2]
 
     # ═══════════════════════════════════════════════════════════════
     # ML MODEL INTEGRATION
@@ -679,7 +761,10 @@ class WeatherEngine:
           gfs025         → ncep_gefs025           (31 members)
           icon_seamless  → icon_seamless_eps       (40 members)
 
+        Innovation 3: Also fetches precipitation_sum ensemble members.
+
         Returns: {model_name: [member_value_1, member_value_2, ...]}
+        Also populates self._last_precip_members for precipitation adjustment.
         """
         cache_key = (self.station_id, target_date, variable, "ensemble")
         if cache_key in WeatherEngine._ensemble_cache:
@@ -695,13 +780,16 @@ class WeatherEngine:
                 WeatherEngine._global_rate_limited = False
 
         ensemble_data = {}
+        self._last_precip_members = {}  # Innovation 3: precipitation data
         ensemble_models = getattr(config, 'ENSEMBLE_MODELS', ["ecmwf_ifs025", "gfs025"])
 
         try:
+            # Innovation 3: fetch both temperature AND precipitation ensemble members
+            daily_vars = f"{variable},precipitation_sum"
             params = {
                 "latitude": self.lat,
                 "longitude": self.lon,
-                "daily": variable,
+                "daily": daily_vars,
                 "timezone": self.tz,
                 "start_date": target_date,
                 "end_date": target_date,
@@ -719,6 +807,7 @@ class WeatherEngine:
                     daily = data["daily"]
                     for model in ensemble_models:
                         members = []
+                        precip_members = []
                         # Resolve the actual key suffix used in the API response
                         api_suffix = self.ENSEMBLE_MODEL_KEY_MAP.get(model, model)
 
@@ -731,17 +820,28 @@ class WeatherEngine:
 
                         # Ensemble members: variable_memberNN_suffix format
                         for key in sorted(daily.keys()):
-                            if not key.startswith(f"{variable}_member"):
-                                continue
-                            if not key.endswith(f"_{api_suffix}"):
-                                continue
-                            val = daily[key]
+                            if key.startswith(f"{variable}_member") and key.endswith(f"_{api_suffix}"):
+                                val = daily[key]
+                                if isinstance(val, list) and val and val[0] is not None:
+                                    members.append(float(val[0]))
+
+                        # Innovation 3: Precipitation ensemble members
+                        precip_control_key = f"precipitation_sum_{api_suffix}"
+                        if precip_control_key in daily:
+                            val = daily[precip_control_key]
                             if isinstance(val, list) and val and val[0] is not None:
-                                members.append(float(val[0]))
+                                precip_members.append(float(val[0]))
+                        for key in sorted(daily.keys()):
+                            if key.startswith("precipitation_sum_member") and key.endswith(f"_{api_suffix}"):
+                                val = daily[key]
+                                if isinstance(val, list) and val and val[0] is not None:
+                                    precip_members.append(float(val[0]))
 
                         if members:
                             ensemble_data[model] = members
                             print(f"  V5 Ensemble {self.station_id}/{model}: {len(members)} members")
+                        if precip_members:
+                            self._last_precip_members[model] = precip_members
 
             elif resp.status_code == 429:
                 print(f"  V5 Ensemble RATE LIMITED (429) for {self.station_id}")
@@ -763,23 +863,67 @@ class WeatherEngine:
 
         return ensemble_data
 
+    def _load_calibration(self) -> Dict[str, Dict]:
+        """Load per-model calibration data from v5_calibration_{station}.json."""
+        cal_dir = getattr(config, 'CALIBRATION_DATA_DIR', 'data')
+        cal_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), cal_dir,
+            f"v5_calibration_{self.station_id}.json"
+        )
+        try:
+            with open(cal_path) as f:
+                data = json.load(f)
+            # Calibration JSON can be either {"models": {...}} or flat {model: {...}}
+            models = data.get("models", data) if isinstance(data, dict) else {}
+            # Map ensemble model names to calibration model names
+            # Ensemble uses gfs025, calibration uses gfs_seamless (both refer to GFS)
+            CAL_NAME_MAP = {
+                "gfs025": "gfs_seamless",
+                "ecmwf_ifs025": "ecmwf_ifs025",
+                "icon_seamless": "icon_seamless",
+            }
+            mapped = {}
+            for model_name, cal_name in CAL_NAME_MAP.items():
+                if cal_name in models:
+                    mapped[model_name] = models[cal_name]
+                elif model_name in models:
+                    mapped[model_name] = models[model_name]
+            return mapped if mapped else models
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
     def compute_ensemble_bucket_probabilities(
-        self, ensemble_members: Dict[str, List[float]], bucket_edges: List[float]
+        self, ensemble_members: Dict[str, List[float]], bucket_edges: List[float],
+        precip_members: Optional[Dict[str, List[float]]] = None,
     ) -> Dict[str, float]:
         """
         V5: Compute bucket probabilities by directly counting ensemble members.
 
-        This is the PRIMARY V5 method — no Monte Carlo or KDE needed.
+        INNOVATION 1: Bias-corrected ensemble — subtract per-model calibrated bias.
+        INNOVATION 3: Precipitation adjustment — shift temps down if heavy rain expected.
+
         P(bucket) = (count of members in bucket + 0.5) / (total_members + 0.5 * n_buckets)
         Uses Laplace smoothing to avoid zero probabilities.
         """
-        # Collect all member values
+        # Load calibration data for bias correction (Innovation 1)
+        calibration = self._load_calibration()
+
+        # Collect all member values with bias correction
+        # Convention: bias = actual - forecast. Add bias to move toward actual.
         all_members = []
         for model, members in ensemble_members.items():
-            all_members.extend(members)
+            cal = calibration.get(model, {})
+            bias = cal.get("bias", 0.0)
+            corrected = [m + bias for m in members]
+            all_members.extend(corrected)
 
         if not all_members:
             return {}
+
+        # Innovation 3: Precipitation adjustment
+        precip_adjustment = self._compute_precip_adjustment(precip_members)
+        if precip_adjustment != 0.0:
+            all_members = [m + precip_adjustment for m in all_members]
 
         total = len(all_members)
         is_fahrenheit = self.unit == "fahrenheit"
@@ -820,6 +964,44 @@ class WeatherEngine:
             bucket_probs = {k: v / total_prob for k, v in bucket_probs.items()}
 
         return bucket_probs
+
+    def _compute_precip_adjustment(self, precip_members: Optional[Dict[str, List[float]]]) -> float:
+        """
+        Innovation 3: Compute temperature adjustment based on precipitation ensemble.
+        Heavy rain → temps run lower than models predict.
+        """
+        if not precip_members:
+            return 0.0
+
+        all_precip = []
+        for members in precip_members.values():
+            all_precip.extend(members)
+
+        if not all_precip:
+            return 0.0
+
+        total = len(all_precip)
+        heavy_threshold = getattr(config, 'PRECIP_HEAVY_THRESHOLD_MM', 5.0)
+        heavy_pct_req = getattr(config, 'PRECIP_HEAVY_MEMBER_PCT', 0.70)
+        dry_threshold = getattr(config, 'PRECIP_DRY_THRESHOLD_MM', 1.0)
+        dry_pct_req = getattr(config, 'PRECIP_DRY_MEMBER_PCT', 0.70)
+
+        heavy_count = sum(1 for p in all_precip if p > heavy_threshold)
+        dry_count = sum(1 for p in all_precip if p < dry_threshold)
+
+        is_fahrenheit = self.unit == "fahrenheit"
+        temp_adj_heavy = getattr(config, 'PRECIP_TEMP_ADJUSTMENT_F', 1.5)
+        temp_adj_dry = getattr(config, 'PRECIP_DRY_TEMP_ADJUSTMENT_F', 0.5)
+
+        if not is_fahrenheit:
+            temp_adj_heavy = temp_adj_heavy * 5.0 / 9.0
+            temp_adj_dry = temp_adj_dry * 5.0 / 9.0
+
+        if heavy_count / total > heavy_pct_req:
+            return -temp_adj_heavy  # Shift temps DOWN
+        elif dry_count / total > dry_pct_req:
+            return temp_adj_dry   # Slight upward shift
+        return 0.0
 
     def fetch_previous_runs(
         self, target_date: str, variable: str = "temperature_2m_max"
