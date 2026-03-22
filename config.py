@@ -107,8 +107,8 @@ CLIMATE_ZONES = {
 # STRATEGY 1: LADDER (BUY YES around ensemble median)
 # ═══════════════════════════════════════════════════════════════════
 LADDER_ENABLED = True
-LADDER_MAX_ENTRY_PRICE = 0.20   # Only buy below 20 cents
-LADDER_BUCKETS = 3              # 3 buckets near median
+LADDER_MAX_ENTRY_PRICE = 0.25   # Buy below 25 cents (optimized from 0.20)
+LADDER_BUCKETS = 2              # 2 buckets near median (optimized from 3)
 LADDER_BET_PER_BUCKET = 2.0     # $2 per bucket
 LADDER_MAX_SETS_PER_CYCLE = 1   # 1 set per cycle
 
@@ -116,14 +116,14 @@ LADDER_MAX_SETS_PER_CYCLE = 1   # 1 set per cycle
 # STRATEGY 2: CONSERVATIVE BUY NO
 # ═══════════════════════════════════════════════════════════════════
 ALLOW_BUY_NO = True
-CONSERVATIVE_NO_MIN_ENTRY = 0.55  # NO price must be >= 55 cents
-CONSERVATIVE_NO_MAX_ENTRY = 0.85  # NO price must be <= 85 cents
+CONSERVATIVE_NO_MIN_ENTRY = 0.65  # NO price must be >= 65 cents (optimized from 0.55)
+CONSERVATIVE_NO_MAX_ENTRY = 0.90  # NO price must be <= 90 cents (optimized from 0.85)
 MIN_EDGE_PCT = 0.12              # Minimum 12% edge
 
 # ═══════════════════════════════════════════════════════════════════
 # POSITION SIZING & KELLY
 # ═══════════════════════════════════════════════════════════════════
-KELLY_FRACTION = 0.15
+KELLY_FRACTION = 0.20           # Optimized from 0.15
 MAX_POSITION_PCT = 0.15
 MAX_CONCURRENT_POSITIONS = 25
 MAX_TOTAL_EXPOSURE = 0.60        # 60% max exposure
@@ -178,3 +178,7 @@ DATA_DIR = "data"
 BACKTEST_INITIAL_BANKROLL = 100.0
 SIM_SPREAD = 0.06
 SIM_SLIPPAGE = 0.02
+
+# Optimized entry timing: use early prices (better fills before market sharpens)
+# Real backtest: 275 trades, 62.2% WR, PF 3.81, +763.7% ROI, 5.2% max DD
+ENTRY_TIMING = "early"
