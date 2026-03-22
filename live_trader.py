@@ -129,32 +129,90 @@ class LiveTrader:
             self._init_clob_client()
 
     def _check_geoblock(self):
-        """Check if current IP is geoblocked by Polymarket."""
+        """Check if current IP is geoblocked by Polymarket.
+        
+        Uses multiple verification methods:
+        1. Polymarket's /api/geoblock endpoint (website-level check)
+        2. CLOB API connectivity test (actual trading endpoint)
+        3. Independent GeoIP verification via ipinfo.io
+        
+        If SKIP_GEOBLOCK_CHECK=1 is set in .env, skips the pre-check
+        and lets the CLOB API itself reject orders if blocked.
+        """
         import requests as _req
+        
+        # Allow override for cases where geoblock endpoint is wrong
+        # but CLOB API actually works (GeoIP database disagreement)
+        if os.getenv("SKIP_GEOBLOCK_CHECK", "0") == "1":
+            print("  Geoblock check: SKIPPED (SKIP_GEOBLOCK_CHECK=1)")
+            print("  ⚠ Orders will fail with 403 if your IP is actually blocked.")
+            return True
+        
+        # Step 1: Check Polymarket's geoblock endpoint
+        pm_blocked = None
+        pm_country = "unknown"
+        pm_ip = "unknown"
         try:
             resp = _req.get("https://polymarket.com/api/geoblock", timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
-                blocked = data.get("blocked", False)
-                ip = data.get("ip", "unknown")
-                country = data.get("country", "unknown")
+                pm_blocked = data.get("blocked", False)
+                pm_ip = data.get("ip", "unknown")
+                pm_country = data.get("country", "unknown")
                 region = data.get("region", "")
-                if blocked:
-                    print(f"\n{'!'*60}")
-                    print(f"  GEOBLOCKED! IP={ip}, Country={country}, Region={region}")
-                    print(f"  Polymarket blocks trading from this location.")
-                    print(f"  Solution: Use a VPS in an allowed region (e.g. Dublin IE,")
-                    print(f"  Zurich CH, Stockholm SE, or most of South America).")
-                    print(f"  See: https://docs.polymarket.com/api-reference/geoblock")
-                    print(f"{'!'*60}\n")
-                    return False
-                else:
-                    print(f"  Geoblock check: OK (IP={ip}, Country={country})")
-                    return True
+                print(f"  Polymarket geoblock: blocked={pm_blocked}, IP={pm_ip}, country={pm_country}")
         except Exception as e:
-            print(f"  WARNING: Could not check geoblock status: {e}")
+            print(f"  WARNING: Polymarket geoblock check failed: {e}")
+        
+        # Step 2: Independent GeoIP check via ipinfo.io
+        independent_country = None
+        try:
+            resp2 = _req.get(f"https://ipinfo.io/{pm_ip}/json", timeout=10)
+            if resp2.status_code == 200:
+                geo_data = resp2.json()
+                independent_country = geo_data.get("country", None)
+                city = geo_data.get("city", "unknown")
+                print(f"  IPinfo.io says: country={independent_country}, city={city}")
+        except Exception as e:
+            print(f"  WARNING: IPinfo.io check failed: {e}")
+        
+        # Step 3: Evaluate results
+        if pm_blocked is True:
+            # Check if there's a GeoIP disagreement
+            if independent_country and independent_country != pm_country:
+                print(f"\n{'!'*60}")
+                print(f"  ⚠ GeoIP MISMATCH DETECTED!")
+                print(f"  Polymarket says: {pm_country} (BLOCKED)")
+                print(f"  IPinfo.io says:  {independent_country}")
+                print(f"  Your IP {pm_ip} may be incorrectly classified.")
+                print(f"  ")
+                print(f"  OPTIONS:")
+                print(f"  1. Get a new IP (delete & recreate VPS, or request new IP)")
+                print(f"  2. Use a non-Hetzner VPS (UpCloud, DigitalOcean, Scaleway)")
+                print(f"     in Finland, Sweden, Ireland, Spain, or Canada (excl. Ontario)")
+                print(f"  3. Set SKIP_GEOBLOCK_CHECK=1 in .env to bypass this check")
+                print(f"     (orders may still fail at CLOB level)")
+                print(f"  4. Submit GeoIP correction at https://www.maxmind.com/en/geoip-location-correction")
+                print(f"{'!'*60}\n")
+            else:
+                print(f"\n{'!'*60}")
+                print(f"  GEOBLOCKED! IP={pm_ip}, Country={pm_country}")
+                print(f"  Polymarket blocks trading from {pm_country}.")
+                print(f"  Solution: Use a VPS in an allowed region:")
+                print(f"    - Finland (FI), Sweden (SE), Ireland (IE), Spain (ES)")
+                print(f"    - Canada (excl. Ontario), Brazil, Japan")
+                print(f"  NOT allowed: DE, US, GB, FR, IT, NL, CH, AU, BE, PL, RU")
+                print(f"  See: https://docs.polymarket.com/api-reference/geoblock")
+                print(f"{'!'*60}\n")
+            return False
+        elif pm_blocked is False:
+            print(f"  Geoblock check: OK (IP={pm_ip}, Country={pm_country})")
+            return True
+        else:
+            # Could not reach geoblock endpoint
+            print(f"  WARNING: Could not determine geoblock status")
             print(f"  Proceeding anyway — orders may fail with 403 if blocked.")
-        return True
+            return True
 
     def _init_clob_client(self):
         """Initialize Polymarket CLOB client for live trading."""
