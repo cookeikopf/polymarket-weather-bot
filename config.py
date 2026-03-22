@@ -192,28 +192,32 @@ STATIONS = {
     },
 }
 
-# Weather models to ensemble (Open-Meteo provides all of these for free)
+# ─── Open-Meteo API Key (optional, for commercial/unlimited access) ───
+# Free tier: 10k calls/day, but VPS IPs often get blocked
+# Commercial: $30/month, unlimited, use customer-api.open-meteo.com
+# Set OPEN_METEO_API_KEY in .env to use commercial endpoint
+OPEN_METEO_API_KEY = os.getenv("OPEN_METEO_API_KEY", "")
+if OPEN_METEO_API_KEY:
+    OPEN_METEO_FORECAST_URL = "https://customer-api.open-meteo.com/v1/forecast"
+    OPEN_METEO_HISTORICAL_URL = "https://customer-archive-api.open-meteo.com/v1/archive"
+    OPEN_METEO_HISTORICAL_FORECAST_URL = "https://customer-historical-forecast-api.open-meteo.com/v1/forecast"
+    OPEN_METEO_PREVIOUS_RUNS_URL = "https://customer-previous-runs-api.open-meteo.com/v1/forecast"
+
+# Weather models — TOP 4 only (reduces API calls by 50% vs 8 models)
+# These 4 cover 72% of ensemble weight and provide sufficient diversity
 WEATHER_MODELS = [
-    "best_match",          # Auto-selects best local model
-    "ecmwf_ifs025",        # ECMWF IFS 0.25° (European flagship)
-    "gfs_seamless",        # GFS (US flagship, NOAA)
-    "icon_seamless",       # ICON (German DWD)
-    "gem_seamless",        # GEM (Canadian)
-    "meteofrance_seamless",# Meteo-France ARPEGE/AROME
-    "jma_seamless",        # JMA (Japan)
-    "ukmo_seamless",       # UK Met Office
+    "best_match",          # Auto-selects best local model (weight: 0.30)
+    "ecmwf_ifs025",        # ECMWF IFS 0.25° — consistently best (weight: 0.35)
+    "gfs_seamless",        # GFS (US flagship, NOAA) (weight: 0.20)
+    "icon_seamless",       # ICON (German DWD) (weight: 0.15)
 ]
 
-# Model weights (learned from historical accuracy, will be optimized)
+# Model weights (normalized to sum to 1.0 for top 4)
 MODEL_WEIGHTS = {
-    "best_match": 0.20,
-    "ecmwf_ifs025": 0.25,  # Consistently best
-    "gfs_seamless": 0.15,
-    "icon_seamless": 0.12,
-    "gem_seamless": 0.08,
-    "meteofrance_seamless": 0.08,
-    "jma_seamless": 0.06,
-    "ukmo_seamless": 0.06,
+    "best_match": 0.30,
+    "ecmwf_ifs025": 0.35,  # Consistently best
+    "gfs_seamless": 0.20,
+    "icon_seamless": 0.15,
 }
 
 # ═══════════════════════════════════════════════════════════════════

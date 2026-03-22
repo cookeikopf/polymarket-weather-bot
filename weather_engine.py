@@ -100,6 +100,8 @@ class WeatherEngine:
                     "temperature_unit": self.unit,
                     "models": ",".join(non_default_models),
                 }
+                if config.OPEN_METEO_API_KEY:
+                    params["apikey"] = config.OPEN_METEO_API_KEY
 
                 resp = requests.get(config.OPEN_METEO_FORECAST_URL, params=params, timeout=20)
                 if resp.status_code == 200:
@@ -146,6 +148,8 @@ class WeatherEngine:
                     "end_date": target_date,
                     "temperature_unit": self.unit,
                 }
+                if config.OPEN_METEO_API_KEY:
+                    params["apikey"] = config.OPEN_METEO_API_KEY
                 resp = requests.get(config.OPEN_METEO_FORECAST_URL, params=params, timeout=15)
                 if resp.status_code == 200:
                     data = resp.json()
@@ -205,6 +209,8 @@ class WeatherEngine:
                     "temperature_unit": self.unit,
                     "models": ",".join(non_default_models),
                 }
+                if config.OPEN_METEO_API_KEY:
+                    params["apikey"] = config.OPEN_METEO_API_KEY
                 resp = requests.get(config.OPEN_METEO_FORECAST_URL, params=params, timeout=20)
                 if resp.status_code == 200:
                     data = resp.json()
@@ -244,6 +250,8 @@ class WeatherEngine:
                     "end_date": target_date,
                     "temperature_unit": self.unit,
                 }
+                if config.OPEN_METEO_API_KEY:
+                    params["apikey"] = config.OPEN_METEO_API_KEY
                 resp = requests.get(config.OPEN_METEO_FORECAST_URL, params=params, timeout=15)
                 if resp.status_code == 200:
                     data = resp.json()
