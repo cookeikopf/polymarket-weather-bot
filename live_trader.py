@@ -1177,11 +1177,19 @@ class LiveTrader:
             logger.error(f"  Warning: Failed to save state: {e}")
 
     def _load_state(self):
-        """Load positions and trade history from disk."""
-        # Try live state first, then paper state
+        """Load positions and trade history from disk.
+        
+        IMPORTANT: Only loads state matching the current mode.
+        Live mode NEVER falls back to paper state (would load fake positions).
+        """
         state_path = f"{config.RESULTS_DIR}/{'paper' if self.paper_mode else 'live'}_trading_state.json"
         if not os.path.exists(state_path):
-            # Also check the old filename
+            # Do NOT fall back to paper state in live mode — paper positions
+            # are simulated and would cause false exposure calculations
+            if not self.paper_mode:
+                logger.info("  No live state found — starting fresh")
+                return
+            # In paper mode, also try legacy filename
             state_path = f"{config.RESULTS_DIR}/paper_trading_state.json"
             if not os.path.exists(state_path):
                 return
@@ -1190,9 +1198,14 @@ class LiveTrader:
             with open(state_path, "r") as f:
                 state = json.load(f)
 
-            # Only load bankroll from live state if matching mode
+            # Verify mode matches — refuse to load mismatched state
             state_mode = state.get("mode", "PAPER")
-            if (state_mode == "LIVE") == (not self.paper_mode):
+            is_live = not self.paper_mode
+            if is_live and state_mode != "LIVE":
+                logger.warning(f"  Ignoring {state_path}: contains {state_mode} state, but we're in LIVE mode")
+                return
+
+            if (state_mode == "LIVE") == is_live:
                 self.bankroll = state.get("bankroll", self.bankroll)
                 self.peak_bankroll = state.get("peak_bankroll", self.peak_bankroll)
 
