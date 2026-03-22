@@ -1,145 +1,101 @@
-# Polymarket Weather Prediction Bot 🌡️📈
+# Polymarket Weather Bot V6
 
-Ein hochprofitabler Weather Prediction Trading Bot für Polymarket, basierend auf einem revolutionären Multi-Model Ensemble Approach mit 20-City Coverage.
+Automated weather temperature trading bot for Polymarket prediction markets.
 
-## Revolutionärer Ansatz
+## Strategy
 
-### 1. Multi-Model Ensemble Forecasting (8 globale NWP-Modelle)
-- **ECMWF IFS** (European Centre) - bestes globales Modell
-- **GFS** (NOAA/USA) - US-Flaggschiff
-- **ICON** (DWD/Deutschland) - exzellent für Mitteleuropa
-- **GEM** (Kanada), **Meteo-France ARPEGE**, **JMA** (Japan), **UKMO** (UK)
-- Automatische Gewichtung nach historischer Genauigkeit (inverse RMSE)
+**Dual-strategy approach** exploiting temperature forecast edges:
 
-### 2. Bayesian Probability Calibration
-- 3 Jahre historische Forecast-vs-Actual Daten
-- Bias-Korrektur pro Modell (z.B. ECMWF: +1.08°F Bias in NYC)
-- Student's t-Verteilung für realistische Tail-Risiken
-- Monte Carlo Simulation (10.000 Samples) für Wahrscheinlichkeitsverteilung
+1. **Ladder (BUY YES):** Buys YES on 3 temperature buckets near the ensemble forecast median at prices below $0.20. One winning bucket pays 5-50x, covering all misses.
 
-### 3. Edge Detection & Kelly Sizing
-- Vergleich unserer ML-Wahrscheinlichkeiten vs. Marktpreise
-- Minimum 7% Edge bevor ein Trade eingegangen wird
-- Fractional Kelly Criterion (0.20x) für konservatives Position Sizing
-- Max 8% pro Position, 40% Gesamtexposure
+2. **Conservative NO (BUY NO):** Buys NO on unlikely temperature outcomes (far from forecast) at entry prices of $0.55–$0.85. High win rate, lower payout per trade.
 
-### 4. Multi-City Expansion (20 Städte weltweit)
-- Alle 20 Polymarket Weather Cities integriert
-- Pro Stadt: individuelle Kalibrierung, Units (°F/°C), Zeitzonen
-- °C-Städte generieren ~28x mehr Trades als °F-Städte (schmalere Buckets)
-- Diversifikation über 6 Kontinente = geringeres Risiko, höheres Volumen
+## Key Features
 
-## Multi-City Backtest (Jan 2025 - März 2026)
+- Multi-model ensemble forecasting (ECMWF, GFS, ICON, GEM, Meteo-France, JMA, UKMO)
+- KDE-based bucket probability computation with ensemble member weighting
+- Live CLOB orderbook integration with effective price discovery
+- Adaptive order placement (taker for strong edges, maker for weak)
+- Full risk management: Kelly sizing, daily loss limits, max drawdown, zone capacity
+- Paper + live trading modes
+- Historical backtester using Open-Meteo archive + historical forecast APIs
+- Gasless trading via Builder API
+- Geoblocking detection + automatic fallback
 
-### Gesamtergebnisse (20 Städte)
+## Architecture
 
-| Metrik | Wert |
-|--------|------|
-| Total Trades | 684 |
-| Win Rate | 76.3% |
-| Avg Edge per Trade | 17.6% |
-| Trades pro Kalendertag | 1.6 |
-| Trades pro Trading Day | 3.4 |
-| Trades pro Woche | 10.9 |
-| Trades pro Monat | 46.8 |
-| Trading-Tage | 46% aller Tage |
-| Total P&L ($1000/Stadt) | $118,234 |
-| Avg P&L pro Trade | $172.86 |
-
-### Top 15 Performing Cities
-
-| Stadt | Trades | Return | Win% | Profit Factor | Edge |
-|-------|--------|--------|------|---------------|------|
-| Toronto | 73 | +1450% | 70% | 7.6 | 16.8% |
-| Tokyo | 80 | +1385% | 70% | 7.3 | 17.8% |
-| Shanghai | 48 | +1051% | 75% | 10.9 | 19.5% |
-| Ankara | 36 | +1013% | 72% | 13.6 | 17.6% |
-| Buenos Aires | 55 | +980% | 78% | 9.6 | 17.9% |
-| München | 62 | +973% | 77% | 8.3 | 16.5% |
-| São Paulo | 46 | +840% | 72% | 8.7 | 16.5% |
-| Paris | 38 | +832% | 79% | 12.6 | 22.1% |
-| Seoul | 25 | +630% | 68% | 11.3 | 15.4% |
-| Singapore | 43 | +592% | 74% | 7.2 | 19.3% |
-| Lucknow | 42 | +504% | 83% | 9.9 | 14.9% |
-| London | 38 | +473% | 92% | 18.7 | 19.3% |
-| Wellington | 35 | +448% | 86% | 10.0 | 21.5% |
-| Tel Aviv | 39 | +419% | 77% | 7.2 | 16.0% |
-| NYC | 24 | +235% | 83% | 11.9 | 11.1% |
-
-**Note:** US °F-Städte (Miami, Atlanta, Chicago, Dallas, Seattle) generieren 0 Trades weil 2°F Buckets zu breit sind. Nur NYC schafft einige Trades.
-
-### Wichtige Erkenntnis: °C vs °F
-
-- **°C Städte**: Durchschnitt 45 Trades/Stadt → 1°C Buckets = engere Ranges = mehr Edges
-- **°F Städte (ohne NYC)**: 0 Trades → 2°F ≈ 1.1°C Buckets sind zu breit
-- **NYC (°F)**: 24 Trades → einzige °F Stadt mit Trades dank höherer Variabilität
-
-## Installation
-
-```bash
-pip install -r requirements.txt
-cp .env.example .env
-# Private Key eintragen in .env (nur für Live-Trading)
+```
+config.py     — All configuration, 20 weather stations, strategy params
+utils.py      — Logging helpers
+weather.py    — Open-Meteo API (forecast, ensemble, historical, archive)
+markets.py    — Gamma API + CLOB (market discovery, orderbook)
+strategy.py   — Edge detection (ladder + conservative NO)
+trader.py     — Execution, positions, P&L, state persistence
+backtest.py   — Historical data backtester
+main.py       — CLI entry point
 ```
 
-## Verwendung
+## Setup
 
 ```bash
-# Status anzeigen
-python main.py status
+# Clone
+git clone https://github.com/cookeikopf/polymarket-weather-bot.git
+cd polymarket-weather-bot
 
-# Kalibrierung ausführen
-python main.py calibrate
+# Install dependencies
+pip install -r requirements.txt
 
-# Backtest ausführen (einzelne Stadt)
-python main.py backtest
+# Configure
+cp .env.example .env
+# Edit .env with your credentials
+```
 
-# Multi-City Backtest (alle 20 Städte)
-python multi_city_backtest.py
+## Usage
 
-# Parameter-Optimierung
-python main.py optimize
+```bash
+# Paper trading (24h continuous)
+python main.py paper
 
-# Aktive Weather-Märkte scannen (Paper Mode)
+# Single scan cycle
 python main.py scan
 
-# Paper Trading (X Minuten)
-python main.py paper 360
+# Quick backtest (14 days, 5 stations)
+python main.py backtest
 
-# Live Trading (ECHTES GELD!)
-python main.py live 360
+# Full backtest (60 days, all stations)
+python main.py backtest full 60
+
+# Live trading (real USDC!)
+python main.py live
+
+# Check status
+python main.py status
 ```
 
-## Architektur
+## Environment Variables
 
-```
-config.py                - Alle 20 Städte + Parameter zentral konfigurierbar
-weather_engine.py        - Multi-Model Ensemble + Kalibrierung (per-city)
-market_scanner.py        - Polymarket Market Discovery (Gamma API)
-edge_detector.py         - Edge Detection + Signal Generation
-backtester.py            - Backtesting Engine (multi-city fähig)
-optimizer.py             - Parameter-Optimierung (5 Profile)
-live_trader.py           - Paper/Live Trading Execution
-main.py                  - CLI Entry Point
-multi_city_backtest.py   - 20-City Backtest + Charts
-final_analysis.py        - Performance Charts + Report
-```
+| Variable | Required | Description |
+|---|---|---|
+| `POLYMARKET_PRIVATE_KEY` | Live only | Ethereum private key |
+| `POLYMARKET_FUNDER_ADDRESS` | Live only | Polygon funder address |
+| `POLYMARKET_SIGNATURE_TYPE` | No | Default: 2 |
+| `POLYMARKET_BANKROLL` | No | Starting bankroll (default: 100) |
+| `POLY_BUILDER_API_KEY` | No | Builder API for gasless trading |
+| `POLY_BUILDER_SECRET` | No | Builder API secret |
+| `POLY_BUILDER_PASSPHRASE` | No | Builder API passphrase |
+| `OPEN_METEO_API_KEY` | Recommended | Commercial API key (€120/mo) |
+| `ORDER_STRATEGY` | No | `taker` / `maker` / `adaptive` (default) |
 
-## Risikomanagement
+## Covered Markets
 
-- **Max Drawdown**: 15-20% → Bot stoppt automatisch
-- **Max Position**: 8% des Bankrolls
-- **Max Exposure**: 40% total
-- **Trailing Stop**: 30% des Peak-Profits
-- **Exit**: 2h vor Market Resolution
-- **Kein Fee**: Weather-Märkte haben keine Trading-Fees auf Polymarket
+20 cities across 10 climate zones: NYC, Miami, Atlanta, Chicago, Dallas, Seattle, London, Paris, Munich, Ankara, Tel Aviv, Toronto, Buenos Aires, São Paulo, Seoul, Shanghai, Tokyo, Singapore, Lucknow, Wellington.
 
-## Hinweise für echtes Trading
+## Risk Parameters
 
-1. **Paper Trading zuerst**: Mindestens 2-4 Wochen mit echten Marktdaten
-2. **Klein anfangen**: $50-100 initial
-3. **Fokus auf °C Städte**: Toronto, Tokyo, München, Buenos Aires, Shanghai — die bringen das Volumen
-4. **Liquidität beachten**: Weather-Märkte haben $2.5K-$15K Volumen
-5. **Re-Kalibrierung**: Monatlich Model Weights aktualisieren
-6. **Multi-City ist Key**: 15 aktive Städte = ~11 Trades/Woche statt ~0.6 mit nur NYC
-7. **Geo-Token**: Ggf. VPN nötig je nach Standort
+- Max daily loss: $20
+- Max drawdown: 20%
+- Max exposure: 60% of bankroll
+- Max concurrent positions: 25
+- Kelly fraction: 0.15
+- Ladder: $2 per bucket, max entry $0.20
+- Conservative NO: min entry $0.55, min edge 12%

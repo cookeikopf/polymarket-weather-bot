@@ -1,7 +1,10 @@
 .env
+results/
+data/
 __pycache__/
 *.pyc
-venv/
-data/
-*.log
-results/paper_trades.json
+*.pyo
+.DS_Store
+*.egg-info/
+dist/
+build/

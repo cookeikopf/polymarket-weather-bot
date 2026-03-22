@@ -1,20 +1,13 @@
 """
-Polymarket Weather Prediction Bot - Configuration
-===================================================
+Polymarket Weather Bot V6 — Configuration
+==========================================
 All tunable parameters in one place.
 
-V4 DUAL STRATEGY — Optimized from retro-analysis + competitive research:
+DUAL STRATEGY:
+  1. LADDER: BUY YES in 3 buckets around ensemble median at low prices (<$0.20)
+  2. CONSERVATIVE NO: BUY NO on unlikely outcomes at high entry (>=0.55)
 
-STRATEGY 1 - LADDER (primary profit driver):
-  Buy YES in 3-5 buckets around ensemble median at low prices (<$0.20)
-  85%+ hit rate on 1-day forecasts, 700-1900% payout per winning bucket
-  This is how the $24k+ bots (neobrother etc.) operate
-
-STRATEGY 2 - CONSERVATIVE NO (steady income):
-  Buy NO on unlikely outcomes at high entry (>=0.65)
-  80% win rate from retro-analysis data
-
-KEY: Weather markets have NO taker fees on Polymarket.
+Weather markets on Polymarket have ZERO taker fees.
 """
 
 import os
@@ -28,439 +21,160 @@ load_dotenv()
 POLYMARKET_HOST = "https://clob.polymarket.com"
 GAMMA_API_HOST = "https://gamma-api.polymarket.com"
 CHAIN_ID = 137  # Polygon mainnet
+
 PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
-POLYMARKET_GEO_TOKEN = os.getenv("POLYMARKET_GEO_TOKEN", "")
-
-# Polymarket wallet/funder address (the Polymarket proxy wallet, NOT your MetaMask)
-# Found in your Polymarket profile URL: https://polymarket.com/profile/<THIS_ADDRESS>
 FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", "")
-
-# Signature type: 0=EOA, 1=POLY_PROXY (Magic/email login), 2=GNOSIS_SAFE (browser wallet)
 SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))
 
-# ─── Builder API (gasless trading + order attribution + rewards) ───
-# Get your keys at: polymarket.com/settings?tab=builder
+# Builder API (gasless trading)
 BUILDER_API_KEY = os.getenv("POLY_BUILDER_API_KEY", "")
 BUILDER_SECRET = os.getenv("POLY_BUILDER_SECRET", "")
 BUILDER_PASSPHRASE = os.getenv("POLY_BUILDER_PASSPHRASE", "")
 
-# Order execution strategy:
-# "taker"    = aggressive (FOK/FAK market orders, instant fill)
-# "maker"    = passive (post-only limit orders, earns liquidity rewards)
-# "adaptive" = uses maker for small edges, taker for large edges
+# Order strategy: "taker" | "maker" | "adaptive"
 ORDER_STRATEGY = os.getenv("ORDER_STRATEGY", "adaptive")
-
-# Adaptive thresholds
-TAKER_EDGE_THRESHOLD = 0.15  # Use taker (aggressive) if edge > 15%
-MAKER_PRICE_OFFSET = 0.001   # Place maker orders 0.1 cent inside spread
+TAKER_EDGE_THRESHOLD = 0.15
+MAKER_PRICE_OFFSET = 0.001
 
 # ═══════════════════════════════════════════════════════════════════
-# WEATHER DATA SOURCES (Open-Meteo - Free, no API key needed)
+# OPEN-METEO WEATHER API
 # ═══════════════════════════════════════════════════════════════════
-OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
-OPEN_METEO_HISTORICAL_URL = "https://archive-api.open-meteo.com/v1/archive"
-OPEN_METEO_HISTORICAL_FORECAST_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
-OPEN_METEO_PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
-OPEN_METEO_ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
-
-# Station coordinates for ALL 20 Polymarket weather cities
-# Coordinates point to the exact weather station used for resolution
-STATIONS = {
-    # ─── USA (°F) ───
-    "NYC": {
-        "name": "LaGuardia Airport, New York",
-        "lat": 40.7769, "lon": -73.8740,
-        "unit": "fahrenheit", "tz": "America/New_York",
-        "slug_name": "nyc",
-    },
-    "Miami": {
-        "name": "Miami International Airport",
-        "lat": 25.7959, "lon": -80.2870,
-        "unit": "fahrenheit", "tz": "America/New_York",
-        "slug_name": "miami",
-    },
-    "Atlanta": {
-        "name": "Hartsfield-Jackson Airport, Atlanta",
-        "lat": 33.6407, "lon": -84.4277,
-        "unit": "fahrenheit", "tz": "America/New_York",
-        "slug_name": "atlanta",
-    },
-    "Chicago": {
-        "name": "O'Hare International Airport, Chicago",
-        "lat": 41.9742, "lon": -87.9073,
-        "unit": "fahrenheit", "tz": "America/Chicago",
-        "slug_name": "chicago",
-    },
-    "Dallas": {
-        "name": "DFW International Airport, Dallas",
-        "lat": 32.8998, "lon": -97.0403,
-        "unit": "fahrenheit", "tz": "America/Chicago",
-        "slug_name": "dallas",
-    },
-    "Seattle": {
-        "name": "Seattle-Tacoma International Airport",
-        "lat": 47.4502, "lon": -122.3088,
-        "unit": "fahrenheit", "tz": "America/Los_Angeles",
-        "slug_name": "seattle",
-    },
-    # ─── Europe (°C) ───
-    "London": {
-        "name": "Heathrow Airport, London",
-        "lat": 51.4700, "lon": -0.4543,
-        "unit": "celsius", "tz": "Europe/London",
-        "slug_name": "london",
-    },
-    "Paris": {
-        "name": "Charles de Gaulle Airport, Paris",
-        "lat": 49.0097, "lon": 2.5479,
-        "unit": "celsius", "tz": "Europe/Paris",
-        "slug_name": "paris",
-    },
-    "Munich": {
-        "name": "Munich Airport",
-        "lat": 48.3537, "lon": 11.7750,
-        "unit": "celsius", "tz": "Europe/Berlin",
-        "slug_name": "munich",
-    },
-    "Ankara": {
-        "name": "Esenboga Airport, Ankara",
-        "lat": 40.1281, "lon": 32.9951,
-        "unit": "celsius", "tz": "Europe/Istanbul",
-        "slug_name": "ankara",
-    },
-    "Tel Aviv": {
-        "name": "Ben Gurion Airport, Tel Aviv",
-        "lat": 32.0055, "lon": 34.8854,
-        "unit": "celsius", "tz": "Asia/Jerusalem",
-        "slug_name": "tel-aviv",
-    },
-    # ─── Americas (°C) ───
-    "Toronto": {
-        "name": "Pearson International Airport, Toronto",
-        "lat": 43.6777, "lon": -79.6248,
-        "unit": "celsius", "tz": "America/Toronto",
-        "slug_name": "toronto",
-    },
-    "Buenos Aires": {
-        "name": "Ezeiza Airport, Buenos Aires",
-        "lat": -34.8222, "lon": -58.5358,
-        "unit": "celsius", "tz": "America/Argentina/Buenos_Aires",
-        "slug_name": "buenos-aires",
-    },
-    "Sao Paulo": {
-        "name": "Guarulhos Airport, Sao Paulo",
-        "lat": -23.4356, "lon": -46.4731,
-        "unit": "celsius", "tz": "America/Sao_Paulo",
-        "slug_name": "sao-paulo",
-    },
-    # ─── Asia (°C) ───
-    "Seoul": {
-        "name": "Incheon International Airport, Seoul",
-        "lat": 37.4602, "lon": 126.4407,
-        "unit": "celsius", "tz": "Asia/Seoul",
-        "slug_name": "seoul",
-    },
-    "Shanghai": {
-        "name": "Pudong International Airport, Shanghai",
-        "lat": 31.1443, "lon": 121.8083,
-        "unit": "celsius", "tz": "Asia/Shanghai",
-        "slug_name": "shanghai",
-    },
-    "Tokyo": {
-        "name": "Haneda Airport, Tokyo",
-        "lat": 35.5494, "lon": 139.7798,
-        "unit": "celsius", "tz": "Asia/Tokyo",
-        "slug_name": "tokyo",
-    },
-    "Singapore": {
-        "name": "Changi Airport, Singapore",
-        "lat": 1.3644, "lon": 103.9915,
-        "unit": "celsius", "tz": "Asia/Singapore",
-        "slug_name": "singapore",
-    },
-    "Lucknow": {
-        "name": "Chaudhary Charan Singh Airport, Lucknow",
-        "lat": 26.7606, "lon": 80.8893,
-        "unit": "celsius", "tz": "Asia/Kolkata",
-        "slug_name": "lucknow",
-    },
-    # ─── Oceania (°C) ───
-    "Wellington": {
-        "name": "Wellington Airport",
-        "lat": -41.3272, "lon": 174.8053,
-        "unit": "celsius", "tz": "Pacific/Auckland",
-        "slug_name": "wellington",
-    },
-}
-
-# ─── Open-Meteo API Key (optional, for commercial/unlimited access) ───
-# Free tier: 10k calls/day, but VPS IPs often get blocked
-# Commercial: $30/month, unlimited, use customer-api.open-meteo.com
-# Set OPEN_METEO_API_KEY in .env to use commercial endpoint
 OPEN_METEO_API_KEY = os.getenv("OPEN_METEO_API_KEY", "")
-if OPEN_METEO_API_KEY:
-    OPEN_METEO_FORECAST_URL = "https://customer-api.open-meteo.com/v1/forecast"
-    OPEN_METEO_HISTORICAL_URL = "https://customer-archive-api.open-meteo.com/v1/archive"
-    OPEN_METEO_HISTORICAL_FORECAST_URL = "https://customer-historical-forecast-api.open-meteo.com/v1/forecast"
-    OPEN_METEO_PREVIOUS_RUNS_URL = "https://customer-previous-runs-api.open-meteo.com/v1/forecast"
-    OPEN_METEO_ENSEMBLE_URL = "https://customer-ensemble-api.open-meteo.com/v1/ensemble"
 
-# Weather models — ALL 8 models (Pro API = no rate limits)
+# Auto-select commercial endpoints when API key is set
+_PREFIX = "customer-" if OPEN_METEO_API_KEY else ""
+FORECAST_URL = f"https://{_PREFIX}api.open-meteo.com/v1/forecast"
+ARCHIVE_URL = f"https://{_PREFIX}archive-api.open-meteo.com/v1/archive"
+HIST_FORECAST_URL = f"https://{_PREFIX}historical-forecast-api.open-meteo.com/v1/forecast"
+ENSEMBLE_URL = f"https://{_PREFIX}ensemble-api.open-meteo.com/v1/ensemble"
+PREVIOUS_RUNS_URL = f"https://{_PREFIX}previous-runs-api.open-meteo.com/v1/forecast"
+
+# Weather models for deterministic forecasts
 WEATHER_MODELS = [
-    "best_match",              # Auto-selects best local model
-    "ecmwf_ifs025",            # ECMWF IFS 0.25° — consistently best
-    "gfs_seamless",            # GFS (US flagship, NOAA)
-    "icon_seamless",           # ICON (German DWD)
-    "gem_seamless",            # GEM (Canadian CMC)
-    "meteofrance_seamless",    # Meteo-France ARPEGE/AROME
-    "jma_seamless",            # JMA (Japan Met Agency)
-    "ukmo_seamless",           # UKMO (UK Met Office)
+    "best_match", "ecmwf_ifs025", "gfs_seamless", "icon_seamless",
+    "gem_seamless", "meteofrance_seamless", "jma_seamless", "ukmo_seamless",
 ]
 
-# Model weights (normalized to sum to 1.0 for all 8)
 MODEL_WEIGHTS = {
-    "best_match": 0.18,
-    "ecmwf_ifs025": 0.22,     # Consistently best
-    "gfs_seamless": 0.15,
-    "icon_seamless": 0.12,
-    "gem_seamless": 0.08,
-    "meteofrance_seamless": 0.10,
-    "jma_seamless": 0.08,
-    "ukmo_seamless": 0.07,
+    "best_match": 0.18, "ecmwf_ifs025": 0.22, "gfs_seamless": 0.15,
+    "icon_seamless": 0.12, "gem_seamless": 0.08, "meteofrance_seamless": 0.10,
+    "jma_seamless": 0.08, "ukmo_seamless": 0.07,
 }
 
-# V5: Ensemble models for probabilistic forecasts (member-based)
-ENSEMBLE_MODELS = [
-    "ecmwf_ifs025",   # 51 members
-    "gfs025",          # 31 members
-    "icon_seamless",   # 40 members
-]
-
-# V5: Previous runs for drift detection
-PREVIOUS_RUNS_DAYS = 2  # Compare last 2 days of model runs
+# Ensemble models (probabilistic, member-based)
+ENSEMBLE_MODELS = ["ecmwf_ifs025", "gfs025", "icon_seamless"]
 
 # ═══════════════════════════════════════════════════════════════════
-# ML & PROBABILITY CALIBRATION
+# STATIONS — All 20 Polymarket weather cities
 # ═══════════════════════════════════════════════════════════════════
-# Historical data window for calibration (years)
-CALIBRATION_YEARS = 3
+STATIONS = {
+    "NYC":          {"name": "LaGuardia Airport, New York",          "lat": 40.7769, "lon": -73.8740, "unit": "fahrenheit", "tz": "America/New_York",                 "slug": "nyc"},
+    "Miami":        {"name": "Miami International Airport",          "lat": 25.7959, "lon": -80.2870, "unit": "fahrenheit", "tz": "America/New_York",                 "slug": "miami"},
+    "Atlanta":      {"name": "Hartsfield-Jackson Airport, Atlanta",  "lat": 33.6407, "lon": -84.4277, "unit": "fahrenheit", "tz": "America/New_York",                 "slug": "atlanta"},
+    "Chicago":      {"name": "O'Hare International Airport, Chicago","lat": 41.9742, "lon": -87.9073, "unit": "fahrenheit", "tz": "America/Chicago",                  "slug": "chicago"},
+    "Dallas":       {"name": "DFW International Airport, Dallas",    "lat": 32.8998, "lon": -97.0403, "unit": "fahrenheit", "tz": "America/Chicago",                  "slug": "dallas"},
+    "Seattle":      {"name": "Seattle-Tacoma International Airport", "lat": 47.4502, "lon": -122.3088,"unit": "fahrenheit", "tz": "America/Los_Angeles",              "slug": "seattle"},
+    "London":       {"name": "Heathrow Airport, London",             "lat": 51.4700, "lon": -0.4543,  "unit": "celsius",    "tz": "Europe/London",                    "slug": "london"},
+    "Paris":        {"name": "Charles de Gaulle Airport, Paris",     "lat": 49.0097, "lon": 2.5479,   "unit": "celsius",    "tz": "Europe/Paris",                     "slug": "paris"},
+    "Munich":       {"name": "Munich Airport",                       "lat": 48.3537, "lon": 11.7750,  "unit": "celsius",    "tz": "Europe/Berlin",                    "slug": "munich"},
+    "Ankara":       {"name": "Esenboga Airport, Ankara",             "lat": 40.1281, "lon": 32.9951,  "unit": "celsius",    "tz": "Europe/Istanbul",                  "slug": "ankara"},
+    "Tel Aviv":     {"name": "Ben Gurion Airport, Tel Aviv",         "lat": 32.0055, "lon": 34.8854,  "unit": "celsius",    "tz": "Asia/Jerusalem",                   "slug": "tel-aviv"},
+    "Toronto":      {"name": "Pearson International Airport",        "lat": 43.6777, "lon": -79.6248, "unit": "celsius",    "tz": "America/Toronto",                  "slug": "toronto"},
+    "Buenos Aires": {"name": "Ezeiza Airport, Buenos Aires",         "lat": -34.8222,"lon": -58.5358, "unit": "celsius",    "tz": "America/Argentina/Buenos_Aires",   "slug": "buenos-aires"},
+    "Sao Paulo":    {"name": "Guarulhos Airport, Sao Paulo",         "lat": -23.4356,"lon": -46.4731, "unit": "celsius",    "tz": "America/Sao_Paulo",                "slug": "sao-paulo"},
+    "Seoul":        {"name": "Incheon International Airport, Seoul", "lat": 37.4602, "lon": 126.4407, "unit": "celsius",    "tz": "Asia/Seoul",                       "slug": "seoul"},
+    "Shanghai":     {"name": "Pudong International Airport",         "lat": 31.1443, "lon": 121.8083, "unit": "celsius",    "tz": "Asia/Shanghai",                    "slug": "shanghai"},
+    "Tokyo":        {"name": "Haneda Airport, Tokyo",                "lat": 35.5494, "lon": 139.7798, "unit": "celsius",    "tz": "Asia/Tokyo",                       "slug": "tokyo"},
+    "Singapore":    {"name": "Changi Airport, Singapore",            "lat": 1.3644,  "lon": 103.9915, "unit": "celsius",    "tz": "Asia/Singapore",                   "slug": "singapore"},
+    "Lucknow":      {"name": "Chaudhary Charan Singh Airport",       "lat": 26.7606, "lon": 80.8893,  "unit": "celsius",    "tz": "Asia/Kolkata",                     "slug": "lucknow"},
+    "Wellington":   {"name": "Wellington Airport",                   "lat": -41.3272,"lon": 174.8053, "unit": "celsius",    "tz": "Pacific/Auckland",                 "slug": "wellington"},
+}
 
-# Kernel Density Estimation bandwidth (auto-tuned via cross-validation)
-KDE_BANDWIDTH = "silverman"  # or float, or "scott"
-
-# Platt scaling / isotonic regression for calibration
-CALIBRATION_METHOD = "isotonic"  # "platt" or "isotonic"
-
-# Number of Monte Carlo samples for probability estimation
-MC_SAMPLES = 10000
-
-# Temperature bucket size (Polymarket uses 2°F buckets)
-TEMP_BUCKET_SIZE_F = 2
+CLIMATE_ZONES = {
+    "US_East":        ["NYC", "Miami", "Atlanta"],
+    "US_Central":     ["Chicago", "Dallas"],
+    "US_West":        ["Seattle"],
+    "Europe":         ["London", "Paris", "Munich"],
+    "Middle_East":    ["Ankara", "Tel Aviv"],
+    "Americas_South": ["Buenos Aires", "Sao Paulo"],
+    "Americas_North": ["Toronto"],
+    "East_Asia":      ["Seoul", "Shanghai", "Tokyo"],
+    "South_Asia":     ["Singapore", "Lucknow"],
+    "Oceania":        ["Wellington"],
+}
 
 # ═══════════════════════════════════════════════════════════════════
-# STRATEGY 1: LADDER (BUY_YES around ensemble median)
+# STRATEGY 1: LADDER (BUY YES around ensemble median)
 # ═══════════════════════════════════════════════════════════════════
-# Buy YES shares in 3-5 buckets centered on the ensemble temperature median
-# Only buy at LOW prices → massive asymmetric payout if correct
 LADDER_ENABLED = True
-LADDER_MAX_ENTRY_PRICE = 0.20   # V5-final: sweet spot for asymmetric payoff
-LADDER_BUCKETS = 3              # V5-final: 3 focused buckets near ensemble median
-LADDER_BET_PER_BUCKET = 2.0     # V5-final: $2 per bucket
-LADDER_MAX_SETS_PER_CYCLE = 1   # V5-final: 1 set per cycle — quality over quantity
+LADDER_MAX_ENTRY_PRICE = 0.20   # Only buy below 20 cents
+LADDER_BUCKETS = 3              # 3 buckets near median
+LADDER_BET_PER_BUCKET = 2.0     # $2 per bucket
+LADDER_MAX_SETS_PER_CYCLE = 1   # 1 set per cycle
 
 # ═══════════════════════════════════════════════════════════════════
-# STRATEGY 2: CONSERVATIVE BUY_NO (steady income)
+# STRATEGY 2: CONSERVATIVE BUY NO
 # ═══════════════════════════════════════════════════════════════════
-ALLOW_BUY_YES = True    # V4: YES enabled for ladder strategy
-ALLOW_BUY_NO = True     # Conservative NO arm
-
-# Conservative NO: only at high entry (= high probability we win)
-CONSERVATIVE_NO_MIN_ENTRY = 0.55  # V5-final: 55% entry — wide net for NO opportunities
-CONSERVATIVE_NO_MAX_ENTRY = 0.85  # Avoid near-certain (low payout)
-
-# Legacy (used by conservative NO arm)
-MIN_ENTRY_PRICE = 0.65   # For BUY_NO strategy
-MAX_ENTRY_PRICE = 0.85   # For BUY_NO strategy
+ALLOW_BUY_NO = True
+CONSERVATIVE_NO_MIN_ENTRY = 0.55  # NO price must be >= 55 cents
+CONSERVATIVE_NO_MAX_ENTRY = 0.85  # NO price must be <= 85 cents
+MIN_EDGE_PCT = 0.12              # Minimum 12% edge
 
 # ═══════════════════════════════════════════════════════════════════
-# EDGE DETECTION & TRADING SIGNALS
+# POSITION SIZING & KELLY
 # ═══════════════════════════════════════════════════════════════════
-# Minimum edge for CONSERVATIVE NO trades
-# Ladder trades don't require edge — they rely on forecast accuracy
-MIN_EDGE_PCT = 0.12  # V5-final: 12% minimum edge — highest Sharpe ratio in optimization
-
-# Minimum absolute probability for a bucket to be tradeable
-MIN_PROBABILITY = 0.02  # 2% — ladder buys low-prob buckets by design
-
-# Confidence threshold (0-1) from ensemble agreement
-MIN_ENSEMBLE_AGREEMENT = 0.45  # 45% — slightly relaxed for more ladder opportunities
-
-# ═══════════════════════════════════════════════════════════════════
-# KELLY CRITERION & POSITION SIZING (CONSERVATIVE for live trading)
-# ═══════════════════════════════════════════════════════════════════
-# Fractional Kelly (full Kelly is too aggressive)
-KELLY_FRACTION = 0.15  # V5-optimized: 15% Kelly confirmed optimal
-
-# Maximum position size as fraction of bankroll
-MAX_POSITION_PCT = 0.15  # V5-final: 15% per trade — backed by 12.6% max drawdown in backtest
-
-# Maximum number of concurrent positions
-MAX_CONCURRENT_POSITIONS = 25  # 3 ladder sets × 5 buckets + NO trades
-
-# Maximum total exposure (sum of all positions / bankroll)
-MAX_TOTAL_EXPOSURE = 0.60  # 60% max — keep 40% in reserve (ladder needs more capital)
-
-# Minimum trade size in USDC
-# Polymarket requires ≥5 shares per order. At price 0.74, $5→6.8 shares (valid).
+KELLY_FRACTION = 0.15
+MAX_POSITION_PCT = 0.15
+MAX_CONCURRENT_POSITIONS = 25
+MAX_TOTAL_EXPOSURE = 0.60        # 60% max exposure
 MIN_TRADE_SIZE_USDC = 5.0
-
-# Maximum trade size in USDC
-MAX_TRADE_SIZE_USDC = 10.0  # $10 max per trade
+MAX_TRADE_SIZE_USDC = 10.0
 
 # ═══════════════════════════════════════════════════════════════════
-# RISK MANAGEMENT (STRICT for live trading)
+# RISK MANAGEMENT
 # ═══════════════════════════════════════════════════════════════════
-# Daily loss limit — stop all trading if daily P&L hits this
-MAX_DAILY_LOSS_USDC = 20.0  # Stop after losing $20 in a single day
-
-# Stop trading if total drawdown exceeds this
-MAX_DRAWDOWN_PCT = 0.20  # 20% max drawdown (was 50% in paper)
-
-# Take profit if edge narrows below this
-TAKE_PROFIT_EDGE_PCT = 0.03  # Exit if edge < 3%
-
-# Time-based exit: exit position X hours before market resolution
-EXIT_HOURS_BEFORE_RESOLUTION = 3  # 3 hours (was 2 in paper)
-
-# Trailing stop on unrealized P&L
-TRAILING_STOP_PCT = 0.25  # 25% of peak unrealized profit (tighter than paper)
+BANKROLL = float(os.getenv("POLYMARKET_BANKROLL", "100.0"))
+MAX_DAILY_LOSS_USDC = 20.0
+MAX_DRAWDOWN_PCT = 0.20
+TAKE_PROFIT_EDGE_PCT = 0.03
+EXIT_HOURS_BEFORE_RESOLUTION = 3
+MAX_POSITIONS_PER_ZONE = 3
 
 # ═══════════════════════════════════════════════════════════════════
-# BACKTESTING
+# ENSEMBLE CONFIDENCE SCALING
 # ═══════════════════════════════════════════════════════════════════
-BACKTEST_START_DATE = "2024-01-01"
-BACKTEST_END_DATE = "2026-03-15"
-BACKTEST_INITIAL_BANKROLL = 100.0  # Starting capital (adjustable via .env)
-LIVE_BANKROLL = float(os.getenv("POLYMARKET_BANKROLL", "100.0"))  # $100 live bankroll
+ENSEMBLE_SPREAD_LOW_STD = 2.5
+ENSEMBLE_SPREAD_HIGH_STD = 5.0
+ENSEMBLE_HIGH_CONF_MULT = 1.5
+ENSEMBLE_LOW_CONF_MULT = 0.5
 
-# Simulated market parameters
-SIM_SPREAD = 0.06        # 6% bid-ask spread (realistic for weather markets)
-SIM_SLIPPAGE = 0.02      # 2% slippage
-SIM_MARKET_NOISE = 0.015 # Market prices are fairly efficient
+MODEL_DISAGREEMENT_THRESH_F = 6.0
+MODEL_AGREEMENT_THRESH_F = 3.0
+DISAGREEMENT_SIZING_MULT = 0.7
+AGREEMENT_SIZING_MULT = 1.8
+
+# Time decay
+TIME_DECAY_FULL_DAYS = 2
+TIME_DECAY_MED_DAYS = 4
+TIME_DECAY_MED_MULT = 0.8
+TIME_DECAY_FAR_MULT = 0.5
+TIME_DECAY_FAR_MIN_EDGE = 0.20
+
+# Market efficiency
+MARKET_EXPECTED_SUM = 1.05
+MARKET_SHARP_THRESHOLD = 0.03
+MARKET_SOFT_THRESHOLD = 0.10
+MARKET_SHARP_EDGE_MULT = 1.5
 
 # ═══════════════════════════════════════════════════════════════════
 # OPERATIONAL
 # ═══════════════════════════════════════════════════════════════════
-SCAN_INTERVAL_SECONDS = 900   # Check markets every 15 min (Pro API can handle it)
-LOG_LEVEL = "INFO"
-PAPER_TRADING = False  # *** LIVE MODE ***
-DATA_DIR = "data"
+SCAN_INTERVAL_SECONDS = 900      # 15 min
+SCAN_DAYS_AHEAD = 2              # 1-2 days (highest accuracy)
 RESULTS_DIR = "results"
+DATA_DIR = "data"
 
-# Recommended scan times (UTC hours) — aligned with NWP model update cycles
-# Models update at 00Z, 06Z, 12Z, 18Z; data available ~2-4h after
-SCAN_TIMES_UTC = [6, 12, 18, 0]
-
-# ═══════════════════════════════════════════════════════════════════
-# CLIMATE ZONES (for position correlation management)
-# ═══════════════════════════════════════════════════════════════════
-CLIMATE_ZONES = {
-    "US_East": ["NYC", "Miami", "Atlanta"],
-    "US_Central": ["Chicago", "Dallas"],
-    "US_West": ["Seattle"],
-    "Europe": ["London", "Paris", "Munich"],
-    "Middle_East": ["Ankara", "Tel Aviv"],
-    "Americas_South": ["Buenos Aires", "Sao Paulo"],
-    "Americas_North": ["Toronto"],
-    "East_Asia": ["Seoul", "Shanghai", "Tokyo"],
-    "South_Asia": ["Singapore", "Lucknow"],
-    "Oceania": ["Wellington"],
-}
-MAX_POSITIONS_PER_ZONE = 3  # Max 3 positions per climate zone (was 15 in paper)
-
-# Slug-based market discovery: number of days ahead to scan
-# 1-2 days: NWP models are 85-90% accurate for 1-day forecasts
-# Longer horizons have significantly lower accuracy
-MARKET_SCAN_DAYS_AHEAD = 2  # Scan 1-2 days ahead (highest forecast accuracy)
-
-# ═══════════════════════════════════════════════════════════════════
-# WEATHER UNDERGROUND (Resolution Data Source)
-# ═══════════════════════════════════════════════════════════════════
-WU_API_KEY = "e1f10a1e78da46f5b10a1e78da96f525"
-WU_API_BASE = "https://api.weather.com/v1/location"
-
-# WU station IDs (ICAO:9:COUNTRY) mapped to our station IDs
-WU_STATIONS = {
-    "NYC":          {"wu": "KLGA:9:US", "units": "e"},
-    "Miami":        {"wu": "KMIA:9:US", "units": "e"},
-    "Atlanta":      {"wu": "KATL:9:US", "units": "e"},
-    "Chicago":      {"wu": "KORD:9:US", "units": "e"},
-    "Dallas":       {"wu": "KDFW:9:US", "units": "e"},
-    "Seattle":      {"wu": "KSEA:9:US", "units": "e"},
-    "London":       {"wu": "EGLL:9:GB", "units": "m"},
-    "Paris":        {"wu": "LFPG:9:FR", "units": "m"},
-    "Munich":       {"wu": "EDDM:9:DE", "units": "m"},
-    "Ankara":       {"wu": "LTAC:9:TR", "units": "m"},
-    "Tel Aviv":     {"wu": "LLBG:9:IL", "units": "m"},
-    "Toronto":      {"wu": "CYYZ:9:CA", "units": "m"},
-    "Buenos Aires": {"wu": "SAEZ:9:AR", "units": "m"},
-    "Sao Paulo":    {"wu": "SBGR:9:BR", "units": "m"},
-    "Seoul":        {"wu": "RKSI:9:KR", "units": "m"},
-    "Shanghai":     {"wu": "ZSPD:9:CN", "units": "m"},
-    "Tokyo":        {"wu": "RJTT:9:JP", "units": "m"},
-    "Singapore":    {"wu": "WSSS:9:SG", "units": "m"},
-    "Lucknow":      {"wu": "VILK:9:IN", "units": "m"},
-    "Wellington":   {"wu": "NZWN:9:NZ", "units": "m"},
-}
-
-# ═══════════════════════════════════════════════════════════════════
-# V5 ADVANCED INNOVATIONS
-# ═══════════════════════════════════════════════════════════════════
-
-# Innovation 1: Bias-Corrected Ensemble
-CALIBRATION_DATA_DIR = "data"  # Directory containing v5_calibration_{station}.json
-
-# Innovation 2: Ensemble Spread Confidence
-ENSEMBLE_SPREAD_LOW_STD = 2.5     # Below this → high confidence (1.8x sizing)
-ENSEMBLE_SPREAD_HIGH_STD = 5.0    # Above this → low confidence (0.6x sizing, was 0.5x)
-ENSEMBLE_HIGH_CONF_MULTIPLIER = 1.5
-ENSEMBLE_LOW_CONF_MULTIPLIER = 0.5
-
-# Innovation 3: Precipitation Adjustment
-PRECIP_HEAVY_THRESHOLD_MM = 5.0   # >5mm = heavy precipitation
-PRECIP_HEAVY_MEMBER_PCT = 0.70    # >70% of members must agree
-PRECIP_TEMP_ADJUSTMENT_F = 1.5    # Adjust temp down by 1.5°F when heavy rain
-PRECIP_DRY_THRESHOLD_MM = 1.0     # <1mm = dry
-PRECIP_DRY_MEMBER_PCT = 0.70      # >70% of members must be dry
-PRECIP_DRY_TEMP_ADJUSTMENT_F = 0.5  # Slight upward adjustment when dry
-
-# Innovation 4: Inter-Model Disagreement
-MODEL_DISAGREEMENT_THRESHOLD_F = 6.0  # >6°F spread = disagreement (was 4°F — too trigger-happy)
-MODEL_AGREEMENT_THRESHOLD_F = 3.0     # <3°F spread = agreement (was 2°F — too strict)
-DISAGREEMENT_SIZING_MULTIPLIER = 0.7  # Only mild reduction (was 0.5x — too harsh)
-AGREEMENT_SIZING_MULTIPLIER = 1.8     # Strong boost on agreement (was 1.3x)
-
-# Innovation 5: Time-Decay
-TIME_DECAY_FULL_CONF_DAYS = 2     # 0-2 days: full confidence (was 1 — 2-day forecasts are still good)
-TIME_DECAY_MED_CONF_DAYS = 4      # 3-4 days: 0.8x sizing
-TIME_DECAY_MED_MULTIPLIER = 0.8
-TIME_DECAY_FAR_MULTIPLIER = 0.5   # 5+ days: 0.5x sizing (was 0.4x)
-TIME_DECAY_FAR_MIN_EDGE = 0.20    # Skip trades with edge < 20% at 5+ days
-
-# Innovation 6: Market Efficiency Scoring
-MARKET_SHARP_THRESHOLD = 0.03     # |sum - 1.05| < 0.03 → sharp market
-MARKET_SOFT_THRESHOLD = 0.10      # |sum - 1.05| > 0.10 → soft market
-MARKET_SHARP_EDGE_MULTIPLIER = 1.5  # Require 1.5x edge in sharp markets
-MARKET_EXPECTED_SUM = 1.05        # Expected sum of YES prices
-
-# Innovation 7: Dynamic Ladder Width + Bimodal Detection
-BIMODAL_GAP_THRESHOLD_F = 4.0     # Min gap between clusters for bimodal detection
-BIMODAL_VALLEY_MAX_DENSITY = 0.03  # Max density in valley to confirm bimodal
-NARROW_PEAK_STD_F = 2.0           # Unimodal narrow: std < 2°F → 2-bucket ladder
-WIDE_PEAK_STD_F = 4.0             # Unimodal wide: std > 4°F → 3-4 bucket ladder
-
-# ML Model
-ML_MODEL_PATH = "data/ml_model.pkl"
-ML_FEATURES_PATH = "data/ml_features.csv"
-WU_DATA_DIR = "data/wu_historical"
-WU_CACHE_DIR = "data/wu_cache"
+# Backtesting defaults
+BACKTEST_INITIAL_BANKROLL = 100.0
+SIM_SPREAD = 0.06
+SIM_SLIPPAGE = 0.02
