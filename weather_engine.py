@@ -286,6 +286,8 @@ class WeatherEngine:
             "end_date": end_date,
             "temperature_unit": self.unit,
         }
+        if config.OPEN_METEO_API_KEY:
+            params["apikey"] = config.OPEN_METEO_API_KEY
 
         resp = requests.get(config.OPEN_METEO_HISTORICAL_URL, params=params, timeout=30)
         if resp.status_code != 200:
@@ -321,6 +323,8 @@ class WeatherEngine:
                 }
                 if model != "best_match":
                     params["models"] = model
+                if config.OPEN_METEO_API_KEY:
+                    params["apikey"] = config.OPEN_METEO_API_KEY
 
                 resp = requests.get(
                     config.OPEN_METEO_HISTORICAL_FORECAST_URL, params=params, timeout=30
@@ -652,14 +656,28 @@ class WeatherEngine:
     _ensemble_cache: Dict[tuple, Dict[str, List[float]]] = {}
     _ensemble_cache_time: Dict[tuple, float] = {}
 
+    # Mapping: config model name → API response suffix in daily keys
+    # The Ensemble API uses different names in the response than in the request.
+    # e.g. request "gfs025" → response keys contain "ncep_gefs025"
+    ENSEMBLE_MODEL_KEY_MAP = {
+        "ecmwf_ifs025":   "ecmwf_ifs025_ensemble",
+        "gfs025":          "ncep_gefs025",
+        "icon_seamless":   "icon_seamless_eps",
+    }
+
     def fetch_ensemble_forecasts(
         self, target_date: str, variable: str = "temperature_2m_max"
     ) -> Dict[str, List[float]]:
         """
         V5: Fetch ensemble member forecasts from Open-Meteo Ensemble API.
 
-        Calls customer-ensemble-api.open-meteo.com with models=ecmwf_ifs025,gfs025
-        Each model returns control + memberNN keys giving 82+ independent scenarios.
+        Calls customer-ensemble-api.open-meteo.com with models=ecmwf_ifs025,gfs025,icon_seamless
+        Each model returns control + memberNN keys giving 122+ independent scenarios.
+
+        IMPORTANT: The API returns different key suffixes than the request model names:
+          ecmwf_ifs025   → ecmwf_ifs025_ensemble  (51 members)
+          gfs025         → ncep_gefs025           (31 members)
+          icon_seamless  → icon_seamless_eps       (40 members)
 
         Returns: {model_name: [member_value_1, member_value_2, ...]}
         """
@@ -701,31 +719,25 @@ class WeatherEngine:
                     daily = data["daily"]
                     for model in ensemble_models:
                         members = []
+                        # Resolve the actual key suffix used in the API response
+                        api_suffix = self.ENSEMBLE_MODEL_KEY_MAP.get(model, model)
+
                         # Control run (plain key with model suffix)
-                        control_key = f"{variable}_{model}"
+                        control_key = f"{variable}_{api_suffix}"
                         if control_key in daily:
                             val = daily[control_key]
                             if isinstance(val, list) and val and val[0] is not None:
                                 members.append(float(val[0]))
 
-                        # Ensemble members: variable_member01_model, variable_member02_model, etc.
-                        # Or: variable_model_member01 format
-                        for key, val in daily.items():
-                            if not key.startswith(variable):
+                        # Ensemble members: variable_memberNN_suffix format
+                        for key in sorted(daily.keys()):
+                            if not key.startswith(f"{variable}_member"):
                                 continue
-                            if "member" not in key:
+                            if not key.endswith(f"_{api_suffix}"):
                                 continue
-                            if model not in key:
-                                continue
+                            val = daily[key]
                             if isinstance(val, list) and val and val[0] is not None:
                                 members.append(float(val[0]))
-
-                        # Also try format: temperature_2m_max_member01 (single-model response)
-                        if not members:
-                            for key, val in daily.items():
-                                if key.startswith(f"{variable}_member"):
-                                    if isinstance(val, list) and val and val[0] is not None:
-                                        members.append(float(val[0]))
 
                         if members:
                             ensemble_data[model] = members
