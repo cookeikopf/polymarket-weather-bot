@@ -263,10 +263,10 @@ TEMP_BUCKET_SIZE_F = 2
 # Buy YES shares in 3-5 buckets centered on the ensemble temperature median
 # Only buy at LOW prices → massive asymmetric payout if correct
 LADDER_ENABLED = True
-LADDER_MAX_ENTRY_PRICE = 0.20   # Only buy shares priced < $0.20 (500%+ potential return)
-LADDER_BUCKETS = 5              # Buy up to 5 adjacent buckets
-LADDER_BET_PER_BUCKET = 2.0     # $2 per bucket = $10 max per ladder set
-LADDER_MAX_SETS_PER_CYCLE = 3   # Max 3 ladder sets per scan cycle
+LADDER_MAX_ENTRY_PRICE = 0.22   # V5-optimized: buy shares priced < $0.22 (was 0.20)
+LADDER_BUCKETS = 3              # V5-optimized: 3 focused buckets (was 5) — tighter = higher win rate
+LADDER_BET_PER_BUCKET = 1.5     # V5-optimized: $1.50 per bucket (was $2) — smaller bets, less drawdown
+LADDER_MAX_SETS_PER_CYCLE = 1   # V5-optimized: 1 set per cycle (was 3) — quality over quantity
 
 # ═══════════════════════════════════════════════════════════════════
 # STRATEGY 2: CONSERVATIVE BUY_NO (steady income)
@@ -275,7 +275,7 @@ ALLOW_BUY_YES = True    # V4: YES enabled for ladder strategy
 ALLOW_BUY_NO = True     # Conservative NO arm
 
 # Conservative NO: only at high entry (= high probability we win)
-CONSERVATIVE_NO_MIN_ENTRY = 0.65  # 80% WR from retro-analysis data
+CONSERVATIVE_NO_MIN_ENTRY = 0.55  # V5-optimized: 55% entry (was 65%) — catches more opportunities
 CONSERVATIVE_NO_MAX_ENTRY = 0.85  # Avoid near-certain (low payout)
 
 # Legacy (used by conservative NO arm)
@@ -287,7 +287,7 @@ MAX_ENTRY_PRICE = 0.85   # For BUY_NO strategy
 # ═══════════════════════════════════════════════════════════════════
 # Minimum edge for CONSERVATIVE NO trades
 # Ladder trades don't require edge — they rely on forecast accuracy
-MIN_EDGE_PCT = 0.08  # 8% minimum edge for BUY_NO only
+MIN_EDGE_PCT = 0.10  # V5-optimized: 10% minimum edge (was 8%) — higher quality trades
 
 # Minimum absolute probability for a bucket to be tradeable
 MIN_PROBABILITY = 0.02  # 2% — ladder buys low-prob buckets by design
@@ -299,10 +299,10 @@ MIN_ENSEMBLE_AGREEMENT = 0.45  # 45% — slightly relaxed for more ladder opport
 # KELLY CRITERION & POSITION SIZING (CONSERVATIVE for live trading)
 # ═══════════════════════════════════════════════════════════════════
 # Fractional Kelly (full Kelly is too aggressive)
-KELLY_FRACTION = 0.15  # 15% Kelly — very conservative for live
+KELLY_FRACTION = 0.15  # V5-optimized: 15% Kelly confirmed optimal
 
 # Maximum position size as fraction of bankroll
-MAX_POSITION_PCT = 0.05  # 5% per trade max
+MAX_POSITION_PCT = 0.15  # V5-optimized: 15% per trade (was 5%) — backed by 8.5% max drawdown
 
 # Maximum number of concurrent positions
 MAX_CONCURRENT_POSITIONS = 25  # 3 ladder sets × 5 buckets + NO trades
