@@ -128,10 +128,45 @@ class LiveTrader:
         if not self.paper_mode:
             self._init_clob_client()
 
+    def _check_geoblock(self):
+        """Check if current IP is geoblocked by Polymarket."""
+        import requests as _req
+        try:
+            resp = _req.get("https://polymarket.com/api/geoblock", timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                blocked = data.get("blocked", False)
+                ip = data.get("ip", "unknown")
+                country = data.get("country", "unknown")
+                region = data.get("region", "")
+                if blocked:
+                    print(f"\n{'!'*60}")
+                    print(f"  GEOBLOCKED! IP={ip}, Country={country}, Region={region}")
+                    print(f"  Polymarket blocks trading from this location.")
+                    print(f"  Solution: Use a VPS in an allowed region (e.g. Dublin IE,")
+                    print(f"  Zurich CH, Stockholm SE, or most of South America).")
+                    print(f"  See: https://docs.polymarket.com/api-reference/geoblock")
+                    print(f"{'!'*60}\n")
+                    return False
+                else:
+                    print(f"  Geoblock check: OK (IP={ip}, Country={country})")
+                    return True
+        except Exception as e:
+            print(f"  WARNING: Could not check geoblock status: {e}")
+            print(f"  Proceeding anyway — orders may fail with 403 if blocked.")
+        return True
+
     def _init_clob_client(self):
         """Initialize Polymarket CLOB client for live trading."""
         if not config.PRIVATE_KEY:
             raise ValueError("PRIVATE_KEY not set in .env file")
+
+        # Check geoblock BEFORE initializing client
+        if not self._check_geoblock():
+            print("  FATAL: Cannot trade from this region. Switch VPS or use a proxy.")
+            print("  Falling back to paper trading mode.")
+            self.paper_mode = True
+            return
 
         try:
             from py_clob_client.client import ClobClient
@@ -740,8 +775,17 @@ class LiveTrader:
                       f"signal={expected_price:.3f} vs orderbook={base_price:.3f} "
                       f"(drift={price_divergence:.3f}). Proceeding with live price.")
 
-            # Determine tick_size from market data
-            tick_size = signal.market.minimum_tick_size or "0.001"
+            # Determine tick_size from market data (query CLOB if available, fallback to market data)
+            tick_size = signal.market.minimum_tick_size or "0.01"
+            # Try to get actual tick size from CLOB client for this token
+            try:
+                if self.clob_client and hasattr(self.clob_client, 'get_tick_size'):
+                    api_tick = self.clob_client.get_tick_size(token_id)
+                    if api_tick:
+                        tick_size = str(api_tick)
+                        logger.info(f"  Tick size from API: {tick_size}")
+            except Exception as e:
+                logger.debug(f"  Could not query tick size from API: {e}")
             tick = float(tick_size)
 
             # Choose order strategy

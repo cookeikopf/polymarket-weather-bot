@@ -51,7 +51,7 @@ class WeatherMarket:
     liquidity: float
     outcomes: List[MarketOutcome] = field(default_factory=list)
     neg_risk: bool = False
-    minimum_tick_size: str = "0.001"  # Default for weather markets
+    minimum_tick_size: str = "0.01"  # Default for weather markets (most use 0.01)
     order_min_size: float = 5.0       # Minimum order size in shares
     unit: str = "°F"
 
@@ -158,7 +158,7 @@ class MarketScanner:
         outcomes = self._parse_outcomes(sub_markets, market_type, unit)
 
         # Get tick size and min order size from API
-        tick_size = str(first_market.get("orderPriceMinTickSize") or first_market.get("minimum_tick_size") or "0.001")
+        tick_size = str(first_market.get("orderPriceMinTickSize") or first_market.get("minimum_tick_size") or "0.01")
         order_min_size = float(first_market.get("orderMinSize", 5))
 
         return WeatherMarket(
