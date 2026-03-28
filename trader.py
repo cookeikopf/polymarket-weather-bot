@@ -517,7 +517,7 @@ class LiveTrader:
         if not self.clob_client:
             return
         try:
-            from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+            from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType, PartialCreateOrderOptions
             from py_clob_client.order_builder.constants import BUY
 
             if signal.direction == "BUY_YES":
@@ -527,28 +527,39 @@ class LiveTrader:
                 if not token_id:
                     return
 
-            # Fetch live orderbook
+            # Fetch live orderbook with effective prices
             depth = self.scanner.fetch_orderbook_depth(token_id)
             if not depth["has_liquidity"]:
                 log.info(f"  [LIVE] Skip {signal.outcome.name}: no liquidity")
                 return
 
-            # Use best ask as taker price
-            base_price = depth["best_ask"]
             tick = float(signal.market.tick_size or "0.01")
-            price = round(round(base_price / tick) * tick, 4)
+
+            # Use eff_buy_price (what we actually pay) for order pricing
+            # This is the /price?side=BUY value — the real cost to acquire
+            eff_buy = depth.get("eff_buy_price", depth["best_ask"])
+
+            # For neg-risk: add 1 tick as slippage buffer to ensure fill
+            # This is our worst-acceptable price (slippage protection)
+            if signal.market.neg_risk:
+                fill_price = eff_buy + tick  # 1 tick above effective buy price
+            else:
+                fill_price = eff_buy
+
+            price = round(round(fill_price / tick) * tick, 4)
             price = max(tick, min(price, 1.0 - tick))
 
-            # Recalculate edge vs real ask price
+            # Recalculate edge vs real cost (use eff_buy, not buffered price)
+            eff_cost = round(round(eff_buy / tick) * tick, 4)
             if signal.direction == "BUY_YES":
-                real_edge = signal.our_probability - price
+                real_edge = signal.our_probability - eff_cost
             else:
-                real_edge = (1.0 - signal.our_probability) - price
+                real_edge = (1.0 - signal.our_probability) - eff_cost
             if real_edge < 0.05:
-                log.info(f"  [LIVE] Skip {signal.outcome.name}: real edge {real_edge:.1%} too low @ ask {price:.4f}")
+                log.info(f"  [LIVE] Skip {signal.outcome.name}: real edge {real_edge:.1%} too low @ eff_buy {eff_cost:.4f}")
                 return
 
-            # Size: floor to 2 decimals, check minimums
+            # Size: use price for cost calculation, check minimums
             size = round(signal.suggested_size_usd / price, 2)
             if size < signal.market.order_min_size:
                 return
@@ -559,38 +570,98 @@ class LiveTrader:
                 if size < signal.market.order_min_size:
                     return
 
-            order_args = OrderArgs(price=price, size=size, side=BUY, token_id=token_id)
-            options = PartialCreateOrderOptions(
-                neg_risk=signal.market.neg_risk, tick_size=signal.market.tick_size,
-            )
+            # Choose order type based on market type
+            if signal.market.neg_risk:
+                # FOK for neg-risk: fill immediately or cancel
+                # amount = dollar amount to spend, price = worst-price limit
+                amount = round(size * price, 2)
+                market_args = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=amount,
+                    side=BUY,
+                    price=price,  # worst acceptable price (slippage protection)
+                )
+                options = PartialCreateOrderOptions(
+                    neg_risk=True, tick_size=signal.market.tick_size,
+                )
+                log.info(f"  [LIVE] FOK {signal.direction} {signal.outcome.name} @ {price:.4f} (eff_buy={eff_buy:.4f}) ${amount:.2f} (edge {real_edge:.1%})")
+                try:
+                    signed = self.clob_client.create_market_order(market_args, options)
+                    resp = self.clob_client.post_order(signed, OrderType.FOK)
+                except Exception as fok_err:
+                    # FOK may fail if not enough liquidity for full fill
+                    # Fall back to FAK (Fill-And-Kill): fill what's available
+                    err_str = str(fok_err)
+                    if "fully filled" in err_str or "FOK" in err_str:
+                        log.info(f"  [LIVE] FOK rejected (insufficient liq), trying FAK...")
+                        try:
+                            signed = self.clob_client.create_market_order(market_args, options)
+                            resp = self.clob_client.post_order(signed, OrderType.FAK)
+                        except Exception as fak_err:
+                            log.warning(f"  [LIVE] FAK also failed: {fak_err}")
+                            return
+                    else:
+                        raise fok_err
+            else:
+                # GTC for regular markets
+                order_args = OrderArgs(price=price, size=size, side=BUY, token_id=token_id)
+                options = PartialCreateOrderOptions(
+                    neg_risk=False, tick_size=signal.market.tick_size,
+                )
+                log.info(f"  [LIVE] GTC {signal.direction} {signal.outcome.name} @ {price:.4f} x {size} (edge {real_edge:.1%})")
+                signed = self.clob_client.create_order(order_args, options)
+                resp = self.clob_client.post_order(signed, OrderType.GTC)
 
-            log.info(f"  [LIVE] {signal.direction} {signal.outcome.name} @ {price:.4f} x {size} (edge {real_edge:.1%})")
-
-            signed = self.clob_client.create_order(order_args, options)
-            resp = self.clob_client.post_order(signed, OrderType.GTC)
-
-            if not resp.get("success"):
-                log.warning(f"  [LIVE] Rejected: {resp.get('errorMsg', 'unknown')}")
+            if not resp or not resp.get("success"):
+                err = resp.get('errorMsg', 'unknown') if resp else 'no response'
+                log.warning(f"  [LIVE] Rejected: {err}")
                 return
 
             order_id = resp.get("orderID", "")
 
-            # Reserve the cost in bankroll immediately (prevents over-spending)
-            reserved_cost = round(size * price, 4)
-            pos = Position(
-                market_slug=signal.market.slug, outcome_name=signal.outcome.name,
-                token_id=token_id, direction=signal.direction,
-                entry_price=price, shares=size, size_usd=reserved_cost,
-                edge_at_entry=real_edge, confidence=signal.confidence,
-                entry_time=utcnow_iso(), resolution_time=signal.market.end_date,
-                station_id=signal.market.station_id, status="pending",
-                order_id=order_id,
-            )
-            self.positions.append(pos)
-            self.bankroll -= reserved_cost
-            self._exchange_token_ids.add(token_id)
-            self._save_state()
-            log.info(f"  [LIVE] ORDER PLACED: {order_id[:16]}... | Reserved ${reserved_cost:.2f} | Bankroll: ${self.bankroll:.2f}")
+            if signal.market.neg_risk:
+                # FOK response tells us the fill directly:
+                #   takingAmount = shares received, makingAmount = dollars spent
+                taking = float(resp.get("takingAmount", 0) or 0)  # shares
+                making = float(resp.get("makingAmount", 0) or 0)  # dollars
+                fok_status = resp.get("status", "")
+                tx_hashes = resp.get("transactionsHashes", [])
+
+                if taking > 0 and making > 0:
+                    fill_price = round(making / taking, 4) if taking > 0 else price
+                    pos = Position(
+                        market_slug=signal.market.slug, outcome_name=signal.outcome.name,
+                        token_id=token_id, direction=signal.direction,
+                        entry_price=fill_price, shares=taking, size_usd=round(making, 4),
+                        edge_at_entry=real_edge, confidence=signal.confidence,
+                        entry_time=utcnow_iso(), resolution_time=signal.market.end_date,
+                        station_id=signal.market.station_id, status="open",
+                        order_id=order_id,
+                    )
+                    self.positions.append(pos)
+                    self.bankroll -= round(making, 4)
+                    self._exchange_token_ids.add(token_id)
+                    self._save_state()
+                    tx_short = tx_hashes[0][:16] if tx_hashes else 'N/A'
+                    log.info(f"  [LIVE] FOK FILLED: {taking:.1f} shares @ ${making:.2f} (price={fill_price:.4f}) | Bankroll: ${self.bankroll:.2f} | tx={tx_short}...")
+                else:
+                    log.info(f"  [LIVE] FOK NO FILL: {signal.outcome.name} (status={fok_status})")
+            else:
+                # GTC: order rests on book, track as pending
+                pos = Position(
+                    market_slug=signal.market.slug, outcome_name=signal.outcome.name,
+                    token_id=token_id, direction=signal.direction,
+                    entry_price=price, shares=size, size_usd=reserved_cost,
+                    edge_at_entry=real_edge, confidence=signal.confidence,
+                    entry_time=utcnow_iso(), resolution_time=signal.market.end_date,
+                    station_id=signal.market.station_id, status="pending",
+                    order_id=order_id,
+                )
+                self.positions.append(pos)
+                self.bankroll -= reserved_cost
+                self._exchange_token_ids.add(token_id)
+                self._save_state()
+                log.info(f"  [LIVE] GTC PLACED: {order_id[:16]}... | Reserved ${reserved_cost:.2f} | Bankroll: ${self.bankroll:.2f}")
 
         except Exception as e:
             log.error(f"  [LIVE] Error: {e}")

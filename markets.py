@@ -201,7 +201,14 @@ class MarketScanner:
     # ─── CLOB Price Enrichment ────────────────────────────────────
 
     def enrich_with_live_prices(self, markets: List[WeatherMarket]) -> List[WeatherMarket]:
-        """Replace Gamma prices with live CLOB orderbook prices."""
+        """Replace Gamma prices with live CLOB effective prices.
+        
+        After enrichment:
+          - outcome.price = midpoint (for edge detection in strategy)
+          - outcome.clob_bid = lower price (normalized bid)
+          - outcome.clob_ask = higher price (normalized ask)
+        Both clob_bid and clob_ask use effective prices, not raw orderbook.
+        """
         enriched = 0
         for market in markets:
             for outcome in market.outcomes:
@@ -211,6 +218,7 @@ class MarketScanner:
                 if not depth["has_liquidity"]:
                     outcome.price = -1.0
                     continue
+                # best_bid/best_ask are already normalized (bid <= ask)
                 live_mid = (depth["best_bid"] + depth["best_ask"]) / 2.0
                 if 0.01 <= live_mid <= 0.99:
                     outcome.price = round(live_mid, 4)
@@ -223,40 +231,69 @@ class MarketScanner:
         return markets
 
     def fetch_orderbook_depth(self, token_id: str) -> Dict:
-        """Fetch orderbook depth and effective prices for a token."""
+        """Fetch orderbook depth and effective prices for a token.
+        
+        For neg-risk markets, the raw orderbook shows 0.01/0.99 spread.
+        The /price endpoint returns effective prices:
+          - /price?side=BUY  → price you PAY to buy  (effective ask)
+          - /price?side=SELL → price you RECEIVE selling (effective bid)
+        Note: in neg-risk markets, eff_bid > eff_ask is possible (inverted spread).
+        We normalize so best_bid <= best_ask for consistent downstream use.
+        """
         book = self._fetch_raw_orderbook(token_id)
         bids = book.get("bids", [])
         asks = book.get("asks", [])
 
-        best_bid = float(bids[0]["price"]) if bids else 0
-        best_ask = float(asks[0]["price"]) if asks else 1
+        raw_bid = float(bids[0]["price"]) if bids else 0
+        raw_ask = float(asks[0]["price"]) if asks else 1
         bid_depth = sum(float(b.get("size", 0)) for b in bids)
         ask_depth = sum(float(a.get("size", 0)) for a in asks)
 
-        # Try effective CLOB prices (for neg-risk markets)
-        eff_bid, eff_ask = best_bid, best_ask
+        # Get effective prices from /price endpoint (critical for neg-risk)
+        eff_buy = None   # what you pay to buy (effective ask)
+        eff_sell = None   # what you receive selling (effective bid)
         try:
             buy_r = requests.get(f"{cfg.POLYMARKET_HOST}/price",
                                  params={"token_id": token_id, "side": "BUY"}, timeout=5)
             sell_r = requests.get(f"{cfg.POLYMARKET_HOST}/price",
                                   params={"token_id": token_id, "side": "SELL"}, timeout=5)
-            if buy_r.status_code == 200 and sell_r.status_code == 200:
-                eff_ask = float(buy_r.json().get("price", best_bid))
-                eff_bid = float(sell_r.json().get("price", best_ask))
+            if buy_r.status_code == 200:
+                eff_buy = float(buy_r.json().get("price", 0))
+            if sell_r.status_code == 200:
+                eff_sell = float(sell_r.json().get("price", 0))
         except Exception:
             pass
 
-        spread = abs(eff_ask - eff_bid)
+        # Use effective prices if available, fall back to raw orderbook
+        if eff_buy and eff_buy > 0:
+            best_ask = eff_buy   # what you pay = ask
+        else:
+            best_ask = raw_ask
+        if eff_sell and eff_sell > 0:
+            best_bid = eff_sell  # what you receive = bid
+        else:
+            best_bid = raw_bid
+
+        # Normalize: ensure best_bid <= best_ask
+        # In neg-risk markets, eff_sell > eff_buy is common (inverted spread)
+        # For downstream code, we want: bid = lower price, ask = higher price
+        if best_bid > best_ask:
+            best_bid, best_ask = best_ask, best_bid
+
+        spread = abs(best_ask - best_bid)
         has_liq = (
             spread < 0.50
-            and eff_bid > 0.001
-            and eff_ask < 0.999
+            and best_bid > 0.001
+            and best_ask < 0.999
         )
 
         return {
-            "best_bid": eff_bid, "best_ask": eff_ask,
+            "best_bid": best_bid, "best_ask": best_ask,
             "bid_depth": bid_depth, "ask_depth": ask_depth,
             "spread": spread, "has_liquidity": has_liq,
+            # Raw effective prices for order execution
+            "eff_buy_price": eff_buy or raw_ask,   # what you actually pay to BUY
+            "eff_sell_price": eff_sell or raw_bid,  # what you actually receive to SELL
         }
 
     def _fetch_raw_orderbook(self, token_id: str) -> dict:
