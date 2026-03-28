@@ -255,18 +255,19 @@ class LiveTrader:
         if self.daily_pnl <= -cfg.MAX_DAILY_LOSS_USDC:
             issues.append(f"Daily loss limit: ${self.daily_pnl:+.2f}")
             self.daily_halt = True
+        # Drawdown: total capital = cash + invested (pending/open orders are NOT losses)
+        invested = sum(p.size_usd for p in self.positions if p.status in ("open", "pending"))
+        total_capital = self.bankroll + invested
         if self.peak_bankroll > 0:
-            dd = (self.peak_bankroll - self.bankroll) / self.peak_bankroll
+            dd = (self.peak_bankroll - total_capital) / self.peak_bankroll
             if dd > cfg.MAX_DRAWDOWN_PCT:
-                issues.append(f"Max drawdown: {dd:.1%}")
+                issues.append(f"Max drawdown: {dd:.1%} (capital ${total_capital:.2f})")
         open_n = sum(1 for p in self.positions if p.status in ("open", "pending"))
         if open_n >= cfg.MAX_CONCURRENT_POSITIONS:
             issues.append(f"Max positions: {open_n}")
-        total_exp = sum(p.size_usd for p in self.positions if p.status in ("open", "pending"))
-        max_exp = self.bankroll * cfg.MAX_TOTAL_EXPOSURE
-        if total_exp >= max_exp:
-            issues.append(f"Max exposure: ${total_exp:.2f}")
-        if self.bankroll < cfg.MIN_TRADE_SIZE_USDC * 2:
+        if invested >= total_capital * cfg.MAX_TOTAL_EXPOSURE:
+            issues.append(f"Max exposure: ${invested:.2f}")
+        if self.bankroll < cfg.MIN_TRADE_SIZE_USDC:
             issues.append(f"Low bankroll: ${self.bankroll:.2f}")
         return issues
 
@@ -465,9 +466,13 @@ class LiveTrader:
         token_id = signal.outcome.token_id if signal.direction == "BUY_YES" else signal.outcome.no_token_id
         if token_id and token_id in self._exchange_token_ids:
             return False
-        # Balance check: don't try to spend more than available
-        open_cost = sum(p.size_usd for p in self.positions if p.status in ("open", "pending"))
-        if open_cost + signal.suggested_size_usd > self.bankroll:
+        # Balance check: don't try to spend more than available cash
+        if signal.suggested_size_usd > self.bankroll:
+            return False
+        # Exposure check: invested + new trade vs total capital
+        invested = sum(p.size_usd for p in self.positions if p.status in ("open", "pending"))
+        total_capital = self.bankroll + invested
+        if invested + signal.suggested_size_usd > total_capital * cfg.MAX_TOTAL_EXPOSURE:
             return False
         # Zone capacity
         zones = cfg.CLIMATE_ZONES
@@ -727,11 +732,19 @@ class LiveTrader:
             log.info(f"  Cycle {cycle} | {datetime.now().strftime('%H:%M:%S')} | ${self.bankroll:.2f}")
             log.info(f"{'─'*40}")
 
+            invested = sum(p.size_usd for p in self.positions if p.status in ("open", "pending"))
+            total_cap = self.bankroll + invested
             if self.peak_bankroll > 0:
-                dd = (self.peak_bankroll - self.bankroll) / self.peak_bankroll
+                dd = (self.peak_bankroll - total_cap) / self.peak_bankroll
                 if dd > cfg.MAX_DRAWDOWN_PCT:
-                    log.warning(f"  DRAWDOWN HALT: {dd:.1%}")
-                    break
+                    log.warning(f"  DRAWDOWN PAUSE: {dd:.1%} (capital ${total_cap:.2f}) — skipping trades, will retry")
+                    # Don't break — just skip this cycle, sync will still check pending orders
+                    self._sync_with_exchange()
+                    self._check_positions()
+                    sleep = min(cfg.SCAN_INTERVAL_SECONDS, (end - datetime.now()).total_seconds())
+                    if sleep > 0:
+                        time.sleep(sleep)
+                    continue
 
             try:
                 self.run_scan_cycle()
