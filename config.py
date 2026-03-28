@@ -114,7 +114,7 @@ CLIMATE_ZONES = {
 LADDER_ENABLED = True
 LADDER_MAX_ENTRY_PRICE = 0.25   # Buy below 25 cents (optimized from 0.20)
 LADDER_BUCKETS = 2              # 2 buckets near median (optimized from 3)
-LADDER_BET_PER_BUCKET = 2.0     # $2 per bucket
+LADDER_BET_PER_BUCKET = 1.50    # $1.50 per bucket (scaled for small bankroll)
 LADDER_MAX_SETS_PER_CYCLE = 1   # 1 set per cycle
 
 # ═══════════════════════════════════════════════════════════════════
@@ -132,8 +132,8 @@ KELLY_FRACTION = 0.20           # Optimized from 0.15
 MAX_POSITION_PCT = 0.15
 MAX_CONCURRENT_POSITIONS = 25
 MAX_TOTAL_EXPOSURE = 0.60        # 60% max exposure
-MIN_TRADE_SIZE_USDC = 5.0
-MAX_TRADE_SIZE_USDC = 10.0
+MIN_TRADE_SIZE_USDC = 1.0
+MAX_TRADE_SIZE_USDC = 5.0
 
 # ═══════════════════════════════════════════════════════════════════
 # RISK MANAGEMENT

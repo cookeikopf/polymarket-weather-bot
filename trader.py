@@ -36,6 +36,7 @@ class Position:
     resolution_time: str
     station_id: str = ""
     status: str = "open"
+    order_id: str = ""
 
 
 @dataclass
@@ -75,6 +76,8 @@ class LiveTrader:
         self.daily_halt = False
 
         self.clob_client = None
+        # Cache of exchange order token_ids (refreshed each cycle)
+        self._exchange_token_ids: set = set()
         self._load_state()
         self._check_daily_reset()
 
@@ -92,6 +95,7 @@ class LiveTrader:
 
         if not self.paper_mode:
             self._init_clob()
+            self._sync_with_exchange()
 
     # ─── CLOB client ──────────────────────────────────────────────
 
@@ -167,6 +171,73 @@ class LiveTrader:
         except Exception:
             return None
 
+    # ─── Exchange Sync ("Portfolio Eyes") ────────────────────────────
+
+    def _sync_with_exchange(self):
+        """Sync pending orders: check fills, cancel stale, refund unfilled."""
+        if self.paper_mode or not self.clob_client:
+            return
+        try:
+            # 1. Check all pending positions for fill status
+            pending = [p for p in self.positions if p.status == "pending"]
+            for pos in pending:
+                order_id = pos.order_id
+                if not order_id:
+                    # No order ID — can't check, assume dead
+                    self.bankroll += pos.size_usd
+                    self.positions.remove(pos)
+                    log.info(f"  [SYNC] Removed orphan pending: {pos.outcome_name}")
+                    continue
+                try:
+                    order_info = self.clob_client.get_order(order_id)
+                    matched = float(order_info.get("size_matched", 0) or 0)
+                    status = order_info.get("status", "")
+
+                    if matched > 0 and status in ("MATCHED", "CLOSED"):
+                        # Fully or partially filled — promote to open
+                        actual_cost = round(matched * pos.entry_price, 4)
+                        refund = pos.size_usd - actual_cost
+                        pos.shares = matched
+                        pos.size_usd = actual_cost
+                        pos.status = "open"
+                        if refund > 0:
+                            self.bankroll += refund
+                        log.info(f"  [SYNC] FILLED: {pos.outcome_name} | {matched:.1f} shares @ ${actual_cost:.2f}")
+                    elif status == "LIVE":
+                        # Still open — leave it (will be checked next cycle)
+                        log.info(f"  [SYNC] Pending: {pos.outcome_name} still LIVE")
+                    else:
+                        # Cancelled, expired, or unknown — refund
+                        self.bankroll += pos.size_usd
+                        self.positions.remove(pos)
+                        log.info(f"  [SYNC] Refunded: {pos.outcome_name} (status={status})")
+                except Exception as e:
+                    log.warning(f"  [SYNC] Order check failed for {pos.outcome_name}: {e}")
+
+            # 2. Refresh exchange order cache
+            self._exchange_token_ids = set()
+            try:
+                orders = self.clob_client.get_orders()
+                if isinstance(orders, list):
+                    for o in orders:
+                        if o.get("status") in ("LIVE", "MATCHED"):
+                            self._exchange_token_ids.add(o.get("asset_id", ""))
+            except Exception:
+                pass
+
+            # Add all our position token_ids too
+            for p in self.positions:
+                if p.status in ("open", "pending"):
+                    self._exchange_token_ids.add(p.token_id)
+
+            open_pos = [p for p in self.positions if p.status == "open"]
+            pending_pos = [p for p in self.positions if p.status == "pending"]
+            invested = sum(p.size_usd for p in open_pos + pending_pos)
+            log.info(f"  [SYNC] Bankroll: ${self.bankroll:.2f} | Invested: ${invested:.2f} | Open: {len(open_pos)} | Pending: {len(pending_pos)}")
+            self._save_state()
+        except Exception as e:
+            log.warning(f"  [SYNC] Failed: {e}")
+
     # ─── Daily tracking ───────────────────────────────────────────
 
     def _check_daily_reset(self):
@@ -188,10 +259,10 @@ class LiveTrader:
             dd = (self.peak_bankroll - self.bankroll) / self.peak_bankroll
             if dd > cfg.MAX_DRAWDOWN_PCT:
                 issues.append(f"Max drawdown: {dd:.1%}")
-        open_n = sum(1 for p in self.positions if p.status == "open")
+        open_n = sum(1 for p in self.positions if p.status in ("open", "pending"))
         if open_n >= cfg.MAX_CONCURRENT_POSITIONS:
             issues.append(f"Max positions: {open_n}")
-        total_exp = sum(p.size_usd for p in self.positions if p.status == "open")
+        total_exp = sum(p.size_usd for p in self.positions if p.status in ("open", "pending"))
         max_exp = self.bankroll * cfg.MAX_TOTAL_EXPOSURE
         if total_exp >= max_exp:
             issues.append(f"Max exposure: ${total_exp:.2f}")
@@ -204,6 +275,7 @@ class LiveTrader:
     def run_scan_cycle(self) -> List[TradingSignal]:
         """One full scan: discover markets → analyze → execute."""
         self._check_daily_reset()
+        self._sync_with_exchange()
         blocking = self._check_safety()
         if blocking:
             for b in blocking:
@@ -330,6 +402,7 @@ class LiveTrader:
 
         ladder = [s for s in signals if s.strategy == "ladder"]
         no_sigs = [s for s in signals if s.strategy == "conservative_no"]
+        sniper = [s for s in signals if s.strategy == "late_sniper"]
 
         # Execute ladder sets
         sets_done = 0
@@ -362,22 +435,45 @@ class LiveTrader:
                 self._execute_one(s)
                 no_done += 1
 
+        # Execute Late Sniper signals
+        sniper.sort(key=lambda s: s.expected_value * s.confidence, reverse=True)
+        sniper_done = 0
+        for s in sniper:
+            if sniper_done >= cfg.SNIPER_MAX_BETS:
+                break
+            if self.daily_halt:
+                break
+            if self._can_trade(s):
+                self._execute_one(s)
+                sniper_done += 1
+                log.info(f"  SNIPER: {s.direction} {s.outcome.name} | Edge {s.edge:.1%}")
+
     def _can_trade(self, signal: TradingSignal) -> bool:
         """Pre-trade check for a single signal."""
         min_sz = cfg.MIN_TRADE_SIZE_USDC if signal.direction == "BUY_NO" else 1.0
         if signal.suggested_size_usd < min_sz:
             return False
-        if len([p for p in self.positions if p.status == "open"]) >= cfg.MAX_CONCURRENT_POSITIONS:
+        active = [p for p in self.positions if p.status in ("open", "pending")]
+        if len(active) >= cfg.MAX_CONCURRENT_POSITIONS:
             return False
-        # Dedup
+        # Dedup: check local state (open + pending)
         if any(p.market_slug == signal.market.slug and p.outcome_name == signal.outcome.name
-               and p.direction == signal.direction and p.status == "open" for p in self.positions):
+               and p.direction == signal.direction and p.status in ("open", "pending")
+               for p in self.positions):
+            return False
+        # Dedup: check exchange orders (prevents duplicates after restart)
+        token_id = signal.outcome.token_id if signal.direction == "BUY_YES" else signal.outcome.no_token_id
+        if token_id and token_id in self._exchange_token_ids:
+            return False
+        # Balance check: don't try to spend more than available
+        open_cost = sum(p.size_usd for p in self.positions if p.status in ("open", "pending"))
+        if open_cost + signal.suggested_size_usd > self.bankroll:
             return False
         # Zone capacity
         zones = cfg.CLIMATE_ZONES
         for zone, stations in zones.items():
             if signal.market.station_id in stations:
-                zone_pos = sum(1 for p in self.positions if p.station_id in stations and p.status == "open")
+                zone_pos = sum(1 for p in self.positions if p.station_id in stations and p.status in ("open", "pending"))
                 if zone_pos >= cfg.MAX_POSITIONS_PER_ZONE:
                     return False
         return True
@@ -426,50 +522,70 @@ class LiveTrader:
                 if not token_id:
                     return
 
-            # Fetch live price
+            # Fetch live orderbook
             depth = self.scanner.fetch_orderbook_depth(token_id)
             if not depth["has_liquidity"]:
+                log.info(f"  [LIVE] Skip {signal.outcome.name}: no liquidity")
                 return
 
+            # Use best ask as taker price
             base_price = depth["best_ask"]
             tick = float(signal.market.tick_size or "0.01")
-
-            strategy = cfg.ORDER_STRATEGY
-            if strategy == "adaptive":
-                strategy = "taker" if signal.edge > cfg.TAKER_EDGE_THRESHOLD else "maker"
-
-            price = base_price - cfg.MAKER_PRICE_OFFSET if strategy == "maker" else base_price
-            price = round(round(price / tick) * tick, 4)
+            price = round(round(base_price / tick) * tick, 4)
             price = max(tick, min(price, 1.0 - tick))
 
+            # Recalculate edge vs real ask price
+            if signal.direction == "BUY_YES":
+                real_edge = signal.our_probability - price
+            else:
+                real_edge = (1.0 - signal.our_probability) - price
+            if real_edge < 0.05:
+                log.info(f"  [LIVE] Skip {signal.outcome.name}: real edge {real_edge:.1%} too low @ ask {price:.4f}")
+                return
+
+            # Size: floor to 2 decimals, check minimums
             size = round(signal.suggested_size_usd / price, 2)
             if size < signal.market.order_min_size:
                 return
+
+            # Final balance guard
+            if signal.suggested_size_usd > self.bankroll:
+                size = round((self.bankroll * 0.9) / price, 2)
+                if size < signal.market.order_min_size:
+                    return
 
             order_args = OrderArgs(price=price, size=size, side=BUY, token_id=token_id)
             options = PartialCreateOrderOptions(
                 neg_risk=signal.market.neg_risk, tick_size=signal.market.tick_size,
             )
 
-            log.info(f"  [LIVE] {signal.direction} {signal.outcome.name} @ {price:.4f} x {size}")
+            log.info(f"  [LIVE] {signal.direction} {signal.outcome.name} @ {price:.4f} x {size} (edge {real_edge:.1%})")
 
             signed = self.clob_client.create_order(order_args, options)
             resp = self.clob_client.post_order(signed, OrderType.GTC)
 
-            if resp.get("success"):
-                pos = Position(
-                    market_slug=signal.market.slug, outcome_name=signal.outcome.name,
-                    token_id=token_id, direction=signal.direction,
-                    entry_price=price, shares=size, size_usd=signal.suggested_size_usd,
-                    edge_at_entry=signal.edge, confidence=signal.confidence,
-                    entry_time=utcnow_iso(), resolution_time=signal.market.end_date,
-                    station_id=signal.market.station_id,
-                )
-                self.positions.append(pos)
-                self._save_state()
-                log.info(f"  [LIVE] Position opened")
-            else:
+            if not resp.get("success"):
                 log.warning(f"  [LIVE] Rejected: {resp.get('errorMsg', 'unknown')}")
+                return
+
+            order_id = resp.get("orderID", "")
+
+            # Reserve the cost in bankroll immediately (prevents over-spending)
+            reserved_cost = round(size * price, 4)
+            pos = Position(
+                market_slug=signal.market.slug, outcome_name=signal.outcome.name,
+                token_id=token_id, direction=signal.direction,
+                entry_price=price, shares=size, size_usd=reserved_cost,
+                edge_at_entry=real_edge, confidence=signal.confidence,
+                entry_time=utcnow_iso(), resolution_time=signal.market.end_date,
+                station_id=signal.market.station_id, status="pending",
+                order_id=order_id,
+            )
+            self.positions.append(pos)
+            self.bankroll -= reserved_cost
+            self._exchange_token_ids.add(token_id)
+            self._save_state()
+            log.info(f"  [LIVE] ORDER PLACED: {order_id[:16]}... | Reserved ${reserved_cost:.2f} | Bankroll: ${self.bankroll:.2f}")
 
         except Exception as e:
             log.error(f"  [LIVE] Error: {e}")

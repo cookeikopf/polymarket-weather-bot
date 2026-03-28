@@ -151,15 +151,12 @@ class EdgeDetector:
             prob = match_probability(outcome.name, our_probs)
             if prob is None:
                 continue
-            price = outcome.price
-            if price < 0:
+            # Must have real CLOB bid to price NO entry accurately
+            if outcome.clob_bid <= 0.01:
                 continue
 
-            # NO entry price
-            if outcome.clob_bid > 0:
-                entry_no = 1.0 - outcome.clob_bid
-            else:
-                entry_no = 1.0 - price
+            # NO entry price = 1 - YES bid (what we actually pay)
+            entry_no = 1.0 - outcome.clob_bid
 
             if entry_no < cfg.CONSERVATIVE_NO_MIN_ENTRY or entry_no > cfg.CONSERVATIVE_NO_MAX_ENTRY:
                 continue
@@ -192,7 +189,7 @@ class EdgeDetector:
 
             signals.append(TradingSignal(
                 market=market, outcome=outcome, our_probability=prob,
-                market_price=price, edge=edge, confidence=confidence,
+                market_price=outcome.price, edge=edge, confidence=confidence,
                 direction="BUY_NO", suggested_size_usd=round(size, 2),
                 expected_value=ev_per_dollar, strategy="conservative_no",
                 reasons=[
@@ -258,8 +255,9 @@ class EdgeDetector:
         best_yes = []
         for outcome in market.outcomes:
             prob = sniper_probs.get(outcome.name, 0)
-            price = outcome.price
-            if price <= 0.005 or price > cfg.SNIPER_MAX_YES_ENTRY:
+            # Use real CLOB ask (what we'd actually pay), not midpoint
+            price = outcome.clob_ask if outcome.clob_ask > 0 else outcome.price
+            if price <= 0.005 or price > cfg.SNIPER_MAX_YES_ENTRY or price >= 0.99:
                 continue
             if prob < 0.10:
                 continue
@@ -295,10 +293,10 @@ class EdgeDetector:
                 break
             prob_yes = sniper_probs.get(outcome.name, 0)
             prob_no = 1.0 - prob_yes
-            price = outcome.price
-            if price <= 0:
+            # Use real CLOB bid for NO entry price
+            if outcome.clob_bid <= 0.01:
                 continue
-            entry_no = 1.0 - price
+            entry_no = 1.0 - outcome.clob_bid
             if entry_no < cfg.SNIPER_MIN_NO_ENTRY or entry_no > cfg.SNIPER_MAX_NO_ENTRY:
                 continue
             edge = prob_no - entry_no
@@ -311,7 +309,7 @@ class EdgeDetector:
             ev_per_dollar = (prob_no * (1-entry_no)/entry_no - (1-prob_no)) if entry_no > 0 else 0
             signals.append(TradingSignal(
                 market=market, outcome=outcome, our_probability=prob_yes,
-                market_price=price, edge=edge, confidence=0.8,
+                market_price=outcome.price, edge=edge, confidence=0.8,
                 direction="BUY_NO", suggested_size_usd=round(size, 2),
                 expected_value=ev_per_dollar, strategy="late_sniper",
                 reasons=[

@@ -248,8 +248,7 @@ class MarketScanner:
 
         spread = abs(eff_ask - eff_bid)
         has_liq = (
-            (eff_bid != best_bid or eff_ask != best_ask)
-            and spread < 0.50
+            spread < 0.50
             and eff_bid > 0.001
             and eff_ask < 0.999
         )
