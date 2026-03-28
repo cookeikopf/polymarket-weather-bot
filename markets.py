@@ -120,6 +120,9 @@ class MarketScanner:
         unit = "°F" if station.get("unit") == "fahrenheit" else "°C"
         first = sub_markets[0]
         tick_size = str(first.get("orderPriceMinTickSize") or "0.01")
+        # Ensure minimum tick size is 0.01 (some markets report 0.001 which is rejected)
+        if float(tick_size) < 0.01:
+            tick_size = "0.01"
         order_min = float(first.get("orderMinSize", 5))
 
         outcomes = self._parse_outcomes(sub_markets, market_type, unit)

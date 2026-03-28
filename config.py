@@ -39,7 +39,7 @@ BUILDER_PASSPHRASE = os.getenv("POLY_BUILDER_PASSPHRASE", "")
 # Order strategy: "taker" | "maker" | "adaptive"
 ORDER_STRATEGY = os.getenv("ORDER_STRATEGY", "adaptive")
 TAKER_EDGE_THRESHOLD = 0.15
-MAKER_PRICE_OFFSET = 0.001
+MAKER_PRICE_OFFSET = 0.01
 
 # ═══════════════════════════════════════════════════════════════════
 # OPEN-METEO WEATHER API
