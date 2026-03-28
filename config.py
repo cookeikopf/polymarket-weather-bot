@@ -1,13 +1,18 @@
 """
-Polymarket Weather Bot V6 — Configuration
-==========================================
+Polymarket Weather Bot V6.2 — Configuration
+=============================================
 All tunable parameters in one place.
 
-DUAL STRATEGY:
-  1. LADDER: BUY YES in 3 buckets around ensemble median at low prices (<$0.20)
-  2. CONSERVATIVE NO: BUY NO on unlikely outcomes at high entry (>=0.55)
+TRIPLE STRATEGY:
+  1. LADDER: BUY YES in 2 buckets around ensemble median at low prices (<$0.25)
+  2. CONSERVATIVE NO: BUY NO on unlikely outcomes at high entry (>=0.65)
+  3. LATE SNIPER: BUY YES/NO using late-market prices when forecast confidence is high
 
 Weather markets on Polymarket have ZERO taker fees.
+
+V6.2 Real Backtest (178 markets, 10 cities, 18 days):
+  1105 trades | 58.4% WR | PF 2.38 | +3009% ROI
+  Ladder: 323 trades +$548 | Cons NO: 451 trades +$819 | Sniper: 331 trades +$1643
 """
 
 import os
@@ -174,11 +179,30 @@ SCAN_DAYS_AHEAD = 2              # 1-2 days (highest accuracy)
 RESULTS_DIR = "results"
 DATA_DIR = "data"
 
+# ═══════════════════════════════════════════════════════════════════
+# STRATEGY 3: LATE SNIPER
+# ═══════════════════════════════════════════════════════════════════
+# Uses tighter probability distribution (~1° MAE) near resolution.
+# Trades at late prices (80% through market lifetime ≈ 6h before resolution)
+# when CLOB prices haven't caught up to improved forecast accuracy.
+LATE_SNIPER_ENABLED = True
+SNIPER_MIN_EDGE = 0.13             # Minimum 13% edge for sniper
+SNIPER_MAX_YES_ENTRY = 0.35        # Max price to buy YES (sniper)
+SNIPER_MIN_NO_ENTRY = 0.55         # Min NO entry price for sniper
+SNIPER_MAX_NO_ENTRY = 0.88         # Max NO entry price for sniper
+SNIPER_BET_PCT = 0.03              # 3% of bankroll per sniper trade
+SNIPER_CONFIDENCE_MULT = 1.5       # Size multiplier (higher confidence late)
+SNIPER_MAX_BETS = 4                # Max sniper trades per market
+SNIPER_STD_F = 1.2                 # Tighter std for F cities (vs ~3° early)
+SNIPER_STD_C = 0.7                 # Tighter std for C cities (vs ~1.5° early)
+SNIPER_MIN_HOURS = 4               # Only snipe within last N hours
+SNIPER_PRICE_TIMING = 0.80         # Use price from 80% through history
+
 # Backtesting defaults
 BACKTEST_INITIAL_BANKROLL = 100.0
 SIM_SPREAD = 0.06
 SIM_SLIPPAGE = 0.02
 
 # Optimized entry timing: use early prices (better fills before market sharpens)
-# Real backtest: 275 trades, 62.2% WR, PF 3.81, +763.7% ROI, 5.2% max DD
+# V6.2 Real backtest: 1105 trades, 58.4% WR, PF 2.38, +3009% ROI
 ENTRY_TIMING = "early"

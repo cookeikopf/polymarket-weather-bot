@@ -292,8 +292,18 @@ class LiveTrader:
         all_signals = []
         exposure = sum(p.size_usd for p in self.positions if p.status == "open")
         for m in candidates:
+            # Compute hours to resolution for Late Sniper timing
+            hours_to_res = 24.0
+            try:
+                if m.end_date:
+                    res_time = datetime.fromisoformat(m.end_date.replace("Z", "+00:00"))
+                    hours_to_res = max(0, (res_time - utcnow()).total_seconds() / 3600)
+            except Exception:
+                pass
+            days_to_res = hours_to_res / 24.0
             signals = self.edge_detector.find_edges(
-                m, m._probs, m._stats, self.bankroll, exposure
+                m, m._probs, m._stats, self.bankroll, exposure,
+                days_to_res=days_to_res, hours_to_res=hours_to_res
             )
             if signals:
                 log.info(f"  {m.station_id}/{m.target_date}: {len(signals)} signals")

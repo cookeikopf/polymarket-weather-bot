@@ -1,8 +1,9 @@
 """
-Edge Detection & Signal Generation V6
-========================================
-Dual strategy: Ladder (BUY YES) + Conservative NO (BUY NO).
+Edge Detection & Signal Generation V6.2
+=========================================
+Triple strategy: Ladder (BUY YES) + Conservative NO (BUY NO) + Late Sniper.
 Includes ensemble confidence, model disagreement, time decay, market efficiency scoring.
+Late Sniper uses tighter probability distribution near resolution time.
 """
 
 import re
@@ -26,7 +27,7 @@ class TradingSignal:
     direction: str          # "BUY_YES" or "BUY_NO"
     suggested_size_usd: float
     expected_value: float   # EV per dollar
-    strategy: str           # "ladder" or "conservative_no"
+    strategy: str           # "ladder", "conservative_no", or "late_sniper"
     reasons: List[str]
 
 
@@ -35,7 +36,8 @@ class EdgeDetector:
 
     def find_edges(self, market: WeatherMarket, our_probs: Dict[str, float],
                    ensemble_stats: dict, bankroll: float,
-                   current_exposure: float = 0, days_to_res: float = 1.0) -> List[TradingSignal]:
+                   current_exposure: float = 0, days_to_res: float = 1.0,
+                   hours_to_res: float = 24.0) -> List[TradingSignal]:
         """Find all trading opportunities for a market."""
         signals = []
 
@@ -56,6 +58,12 @@ class EdgeDetector:
             signals.extend(self._conservative_no_signals(
                 market, our_probs, ensemble_stats, bankroll, current_exposure,
                 eff_min_edge, sizing_mult
+            ))
+
+        # Strategy 3: Late Sniper — only in the last few hours before resolution
+        if cfg.LATE_SNIPER_ENABLED and hours_to_res <= cfg.SNIPER_MIN_HOURS:
+            signals.extend(self._late_sniper_signals(
+                market, our_probs, ensemble_stats, bankroll, current_exposure
             ))
 
         # Filter low-edge trades at long horizons
@@ -192,6 +200,126 @@ class EdgeDetector:
                     f"Entry {entry_no:.3f} | Edge {edge:.1%}",
                 ],
             ))
+
+        return signals
+
+    # ─── Strategy 3: Late Sniper ─────────────────────────────────
+
+    def _late_sniper_signals(self, market, our_probs, stats, bankroll,
+                             exposure) -> List[TradingSignal]:
+        """Buy YES/NO using tighter probability distribution near resolution.
+        
+        Key insight: forecast accuracy is ~1° MAE close to resolution,
+        but CLOB prices stay stale for hours — exploitable edge.
+        Uses cfg.SNIPER_STD_F/C instead of the wider early-forecast std.
+        """
+        signals = []
+        mean = stats.get("mean", stats.get("median"))
+        if mean is None:
+            return signals
+
+        station = cfg.STATIONS.get(market.station_id, {})
+        is_f = station.get("unit") == "fahrenheit"
+        std = cfg.SNIPER_STD_F if is_f else cfg.SNIPER_STD_C
+
+        from scipy import stats as sp_stats
+        
+        # Compute tighter probabilities
+        sniper_probs = {}
+        for outcome in market.outcomes:
+            bucket_temp = extract_bucket_temp(outcome.name, is_f)
+            if bucket_temp is None:
+                sniper_probs[outcome.name] = 0.01
+                continue
+            is_low = bool(re.search(r'or\s+below', outcome.name, re.I))
+            is_high = bool(re.search(r'or\s+higher', outcome.name, re.I))
+            if is_low:
+                prob = sp_stats.norm.cdf(bucket_temp + 0.5, loc=mean, scale=std)
+            elif is_high:
+                prob = 1.0 - sp_stats.norm.cdf(bucket_temp - 0.5, loc=mean, scale=std)
+            else:
+                if is_f:
+                    m2 = re.search(r'(-?\d+)\s*[-–]\s*(-?\d+)', outcome.name)
+                    lo, hi = (int(m2.group(1)), int(m2.group(2)) + 1) if m2 else (bucket_temp-1, bucket_temp+1)
+                else:
+                    lo, hi = bucket_temp, bucket_temp + 1
+                prob = sp_stats.norm.cdf(hi, loc=mean, scale=std) - \
+                       sp_stats.norm.cdf(lo, loc=mean, scale=std)
+            sniper_probs[outcome.name] = max(prob, 0.001)
+
+        total = sum(sniper_probs.values())
+        if total > 0:
+            sniper_probs = {k: v/total for k, v in sniper_probs.items()}
+
+        sniper_count = 0
+        base_size = bankroll * cfg.SNIPER_BET_PCT * cfg.SNIPER_CONFIDENCE_MULT
+
+        # 3a: Sniper BUY YES — forecast confident, late price still cheap
+        best_yes = []
+        for outcome in market.outcomes:
+            prob = sniper_probs.get(outcome.name, 0)
+            price = outcome.price
+            if price <= 0.005 or price > cfg.SNIPER_MAX_YES_ENTRY:
+                continue
+            if prob < 0.10:
+                continue
+            edge = prob - price
+            if edge < cfg.SNIPER_MIN_EDGE:
+                continue
+            ev_per_dollar = (prob * (1/price - 1) - (1-prob)) if price > 0 else 0
+            best_yes.append((outcome, prob, price, edge, ev_per_dollar))
+
+        best_yes.sort(key=lambda x: x[4], reverse=True)
+        for outcome, prob, price, edge, ev in best_yes[:cfg.SNIPER_MAX_BETS]:
+            if sniper_count >= cfg.SNIPER_MAX_BETS:
+                break
+            remaining = bankroll * cfg.MAX_TOTAL_EXPOSURE - exposure
+            size = min(base_size, remaining)
+            if size < cfg.MIN_TRADE_SIZE_USDC:
+                continue
+            signals.append(TradingSignal(
+                market=market, outcome=outcome, our_probability=prob,
+                market_price=price, edge=edge, confidence=0.8,
+                direction="BUY_YES", suggested_size_usd=round(size, 2),
+                expected_value=ev, strategy="late_sniper",
+                reasons=[
+                    f"SNIPER YES: {outcome.name} (price {price:.3f}, P={prob:.1%})",
+                    f"Edge {edge:.1%} | EV/$ {ev:.2f} | std={std}",
+                ],
+            ))
+            sniper_count += 1
+
+        # 3b: Sniper BUY NO — very confident the outcome is wrong
+        for outcome in market.outcomes:
+            if sniper_count >= cfg.SNIPER_MAX_BETS:
+                break
+            prob_yes = sniper_probs.get(outcome.name, 0)
+            prob_no = 1.0 - prob_yes
+            price = outcome.price
+            if price <= 0:
+                continue
+            entry_no = 1.0 - price
+            if entry_no < cfg.SNIPER_MIN_NO_ENTRY or entry_no > cfg.SNIPER_MAX_NO_ENTRY:
+                continue
+            edge = prob_no - entry_no
+            if edge < cfg.SNIPER_MIN_EDGE:
+                continue
+            remaining = bankroll * cfg.MAX_TOTAL_EXPOSURE - exposure
+            size = min(base_size, remaining)
+            if size < cfg.MIN_TRADE_SIZE_USDC:
+                continue
+            ev_per_dollar = (prob_no * (1-entry_no)/entry_no - (1-prob_no)) if entry_no > 0 else 0
+            signals.append(TradingSignal(
+                market=market, outcome=outcome, our_probability=prob_yes,
+                market_price=price, edge=edge, confidence=0.8,
+                direction="BUY_NO", suggested_size_usd=round(size, 2),
+                expected_value=ev_per_dollar, strategy="late_sniper",
+                reasons=[
+                    f"SNIPER NO: {outcome.name} unlikely (P(NO)={prob_no:.1%})",
+                    f"Entry {entry_no:.3f} | Edge {edge:.1%}",
+                ],
+            ))
+            sniper_count += 1
 
         return signals
 
