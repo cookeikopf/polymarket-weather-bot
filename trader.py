@@ -96,6 +96,7 @@ class LiveTrader:
         if not self.paper_mode:
             self._init_clob()
             self._sync_with_exchange()
+            self._verify_portfolio()
 
     # ─── CLOB client ──────────────────────────────────────────────
 
@@ -237,6 +238,84 @@ class LiveTrader:
             self._save_state()
         except Exception as e:
             log.warning(f"  [SYNC] Failed: {e}")
+
+    def _verify_portfolio(self):
+        """Verify internal state against real Polymarket positions (portfolio eyes).
+        Fetches actual positions from the data API and logs discrepancies.
+        If there are untracked positions, logs a WARNING so the operator knows.
+        """
+        if self.paper_mode:
+            return
+        try:
+            funder = cfg.FUNDER_ADDRESS
+            if not funder:
+                return
+            resp = requests.get(
+                f"https://data-api.polymarket.com/positions?user={funder}",
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                log.warning(f"  [EYES] Portfolio API returned {resp.status_code}")
+                return
+
+            real_positions = resp.json()
+            if not isinstance(real_positions, list):
+                return
+
+            log.info(f"  [EYES] Polymarket has {len(real_positions)} real positions")
+
+            # Build lookup of our tracked positions by token_id
+            tracked = {p.token_id: p for p in self.positions if p.status in ("open", "pending")}
+
+            for rp in real_positions:
+                token_id = rp.get("asset", "")
+                real_shares = float(rp.get("size", 0))
+                real_cost = float(rp.get("initialValue", 0))
+                title = rp.get("title", "?")[:60]
+                cur_price = float(rp.get("curPrice", 0))
+                cur_value = float(rp.get("currentValue", 0))
+                pnl = float(rp.get("cashPnl", 0))
+
+                if token_id in tracked:
+                    tp = tracked[token_id]
+                    share_diff = abs(real_shares - tp.shares)
+                    if share_diff > 0.01:
+                        log.warning(
+                            f"  [EYES] MISMATCH {tp.outcome_name}: "
+                            f"bot={tp.shares:.2f} vs exchange={real_shares:.2f} shares "
+                            f"(diff={share_diff:.2f})"
+                        )
+                    else:
+                        log.info(
+                            f"  [EYES] OK {tp.outcome_name}: {real_shares:.1f} shares, "
+                            f"value=${cur_value:.2f}, P&L=${pnl:+.2f}"
+                        )
+                else:
+                    log.warning(
+                        f"  [EYES] UNTRACKED on exchange: {title} | "
+                        f"{real_shares:.1f} shares, cost=${real_cost:.2f}, value=${cur_value:.2f}"
+                    )
+
+            # Check for positions we track but exchange doesn't have
+            real_token_ids = {rp.get("asset", "") for rp in real_positions}
+            for token_id, tp in tracked.items():
+                if token_id not in real_token_ids:
+                    log.warning(
+                        f"  [EYES] PHANTOM {tp.outcome_name}: bot tracks {tp.shares:.2f} shares "
+                        f"but exchange has 0"
+                    )
+
+            # Log portfolio summary
+            total_value = sum(float(rp.get("currentValue", 0)) for rp in real_positions)
+            total_pnl = sum(float(rp.get("cashPnl", 0)) for rp in real_positions)
+            invested = sum(p.size_usd for p in self.positions if p.status in ("open", "pending"))
+            log.info(
+                f"  [EYES] Portfolio: cash=${self.bankroll:.2f} + "
+                f"positions=${total_value:.2f} = ${self.bankroll + total_value:.2f} | "
+                f"P&L=${total_pnl:+.2f}"
+            )
+        except Exception as e:
+            log.warning(f"  [EYES] Portfolio check failed: {e}")
 
     # ─── Daily tracking ───────────────────────────────────────────
 
@@ -826,6 +905,7 @@ class LiveTrader:
 
             if cycle % 5 == 0:
                 self.print_report()
+                self._verify_portfolio()
 
             sleep = min(cfg.SCAN_INTERVAL_SECONDS, (end - datetime.now()).total_seconds())
             if sleep > 0:
