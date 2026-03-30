@@ -1,8 +1,10 @@
 """
-Weather Prediction Engine V6
-==============================
+Weather Prediction Engine V7.1
+================================
 Multi-model ensemble weather forecasting via Open-Meteo APIs.
 Supports: deterministic forecasts, ensemble members, historical forecasts, archive data.
+
+V7.1 FIX: Balanced ensemble vs deterministic weighting in compute_bucket_probabilities().
 """
 
 import time
@@ -282,25 +284,36 @@ class WeatherEngine:
                                       is_fahrenheit: bool) -> Dict[str, float]:
         """Compute probability for each temperature bucket using ensemble members + KDE.
 
+        V7.1 FIX: Balanced weighting between ensemble and deterministic models.
+        Previously ensemble members (3 models x ~50 members = ~150 samples at weight 1.0)
+        overwhelmed deterministic models (8 models at weight ~0.04 each), giving ensemble
+        ~99.8% influence. Ensemble models show systematic cold bias, causing the bot to
+        bet on buckets that are too low.
+
+        New approach: Each ensemble MODEL gets total weight = its model_weight, spread
+        evenly across its members. Deterministic models keep their full model_weight.
+        Result: ~40% ensemble, ~60% deterministic — both contribute meaningfully.
+
         Returns {bucket_label: probability}.
         """
-        # Collect all temperature samples
+        # Collect all temperature samples with balanced weights
         samples = []
         weights = []
 
-        # Ensemble members (high weight)
+        # Ensemble members: spread each model's weight across its members
         if ensemble_data:
             for model, members in ensemble_data.items():
+                model_w = cfg.MODEL_WEIGHTS.get(model, 0.10)
+                per_member_w = model_w / len(members) if members else 0
                 for m in members:
                     samples.append(m)
-                    weights.append(1.0)
+                    weights.append(per_member_w)
 
-        # Deterministic forecasts (lower weight if we have ensemble)
-        has_ensemble = len(samples) > 0
+        # Deterministic forecasts: full model weight each
         for model, temp in forecasts.items():
             samples.append(temp)
-            w = cfg.MODEL_WEIGHTS.get(model, 0.1)
-            weights.append(w * (0.3 if has_ensemble else 1.0))
+            w = cfg.MODEL_WEIGHTS.get(model, 0.10)
+            weights.append(w)
 
         if not samples:
             return {}
