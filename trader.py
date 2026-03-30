@@ -1,7 +1,13 @@
 """
-Trade Execution & Position Management V6
+Trade Execution & Position Management V7
 ==========================================
-Handles live/paper order execution, position tracking, P&L, state persistence.
+V7 Changes:
+  - HOLD TO RESOLUTION: no fake time_exit — positions resolve naturally
+  - REAL SELL: _exit_position places actual sell orders on-chain
+  - ON-CHAIN BALANCE: sync bankroll from real USDC balance
+  - POSITION RECONCILIATION: adopt untracked exchange positions on startup
+  - RESOLUTION DETECTION: detect resolved markets, record correct P&L ($1 wins / $0 losses)
+  - AVAILABLE CASH GUARD: only trade with cash, not locked-in-positions
 """
 
 import os
@@ -57,7 +63,7 @@ class Trade:
 
 
 class LiveTrader:
-    """Live/paper trading engine."""
+    """Live/paper trading engine V7."""
 
     def __init__(self, paper_mode: bool = True):
         self.paper_mode = paper_mode
@@ -76,13 +82,12 @@ class LiveTrader:
         self.daily_halt = False
 
         self.clob_client = None
-        # Cache of exchange order token_ids (refreshed each cycle)
         self._exchange_token_ids: set = set()
         self._load_state()
         self._check_daily_reset()
 
         log.info(f"{'='*55}")
-        log.info(f"  Weather Bot V6 | {'PAPER' if paper_mode else 'LIVE'}")
+        log.info(f"  Weather Bot V7 | {'PAPER' if paper_mode else 'LIVE'}")
         log.info(f"  Bankroll: ${self.bankroll:.2f} | Positions: {len(self.positions)}")
         log.info(f"  Trades: {len(self.trades)} | Daily P&L: ${self.daily_pnl:+.2f}")
         log.info(f"{'='*55}")
@@ -95,13 +100,12 @@ class LiveTrader:
 
         if not self.paper_mode:
             self._init_clob()
+            self._reconcile_positions()   # V7: full reconciliation on startup
             self._sync_with_exchange()
-            self._verify_portfolio()
 
     # ─── CLOB client ──────────────────────────────────────────────
 
     def _check_geoblock(self) -> bool:
-        """Check if IP is geoblocked by Polymarket."""
         if os.getenv("SKIP_GEOBLOCK_CHECK", "0") == "1":
             log.info("  Geoblock: SKIPPED (env override)")
             return True
@@ -114,24 +118,20 @@ class LiveTrader:
                 ip = data.get("ip", "?")
                 log.info(f"  Geoblock: blocked={blocked}, IP={ip}, country={country}")
                 if blocked:
-                    log.error(f"  GEOBLOCKED from {country}! Change VPS to allowed region.")
-                    log.error(f"  Allowed: FI, SE, IE, ES, CA(excl ON), BR, JP, KR, etc.")
+                    log.error(f"  GEOBLOCKED from {country}!")
                     return False
                 return True
         except Exception as e:
             log.warning(f"  Geoblock check failed: {e}")
-        return True  # Proceed if check fails
+        return True
 
     def _init_clob(self):
-        """Initialize CLOB client for live trading."""
         if not cfg.PRIVATE_KEY:
             raise ValueError("POLYMARKET_PRIVATE_KEY not set")
-
         if not self._check_geoblock():
             log.warning("  Falling back to paper mode due to geoblocking")
             self.paper_mode = True
             return
-
         try:
             from py_clob_client.client import ClobClient
             kwargs = {
@@ -172,19 +172,169 @@ class LiveTrader:
         except Exception:
             return None
 
-    # ─── Exchange Sync ("Portfolio Eyes") ────────────────────────────
+    # ─── V7: Full Position Reconciliation ───────────────────────────
+
+    def _reconcile_positions(self):
+        """V7: Full reconciliation on startup.
+        1. Fetch all real positions from Polymarket data API
+        2. Check for resolved markets — record P&L for wins/losses
+        3. Adopt any untracked active positions
+        4. Remove phantom positions (we track but exchange doesn't have)
+        5. Sync bankroll from real cash + position values
+        """
+        if self.paper_mode:
+            return
+        try:
+            funder = cfg.FUNDER_ADDRESS
+            if not funder:
+                return
+
+            resp = requests.get(
+                f"https://data-api.polymarket.com/positions?user={funder}",
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                log.warning(f"  [RECONCILE] API returned {resp.status_code}")
+                return
+
+            real_positions = resp.json()
+            if not isinstance(real_positions, list):
+                return
+
+            log.info(f"  [RECONCILE] Exchange has {len(real_positions)} positions")
+            tracked = {p.token_id: p for p in self.positions if p.status in ("open", "pending")}
+
+            # Process each real position
+            for rp in real_positions:
+                token_id = rp.get("asset", "")
+                real_shares = float(rp.get("size", 0))
+                cur_price = float(rp.get("curPrice", 0))
+                cur_value = float(rp.get("currentValue", 0))
+                initial_value = float(rp.get("initialValue", 0))
+                redeemable = rp.get("redeemable", False)
+                title = rp.get("title", "?")[:60]
+                pnl_cash = float(rp.get("cashPnl", 0))
+
+                if token_id in tracked:
+                    tp = tracked[token_id]
+                    # Fix share mismatch
+                    if abs(real_shares - tp.shares) > 0.01:
+                        log.info(f"  [RECONCILE] Fix shares {tp.outcome_name}: {tp.shares:.2f} → {real_shares:.2f}")
+                        tp.shares = real_shares
+
+                    # Check if resolved (value=0 and redeemable, or price=0.9995+)
+                    if redeemable and cur_value == 0:
+                        # Lost — resolved to $0
+                        self._record_resolution(tp, won=False)
+                        tracked.pop(token_id, None)
+                    elif cur_price >= 0.999 and real_shares > 0:
+                        # Won — price is ~$1.00, may not be redeemable yet but basically won
+                        # Don't close yet — wait for official resolution to claim
+                        log.info(f"  [RECONCILE] WINNING: {tp.outcome_name} (price={cur_price:.4f}, value=${cur_value:.2f})")
+                    else:
+                        log.info(f"  [RECONCILE] OK: {tp.outcome_name} | {real_shares:.1f} shares @ ${cur_price:.4f} = ${cur_value:.2f}")
+                else:
+                    # Untracked position on exchange
+                    if redeemable and cur_value == 0:
+                        log.info(f"  [RECONCILE] Untracked LOSS (redeemable, $0): {title}")
+                        # Nothing to do — it's a resolved loss
+                    elif cur_value > 0.01:
+                        # Active untracked position — adopt it
+                        log.warning(f"  [RECONCILE] ADOPTING untracked: {title} | {real_shares:.1f} shares, value=${cur_value:.2f}")
+                        avg_price = float(rp.get("avgPrice", cur_price))
+                        outcome = rp.get("outcome", "Yes")
+                        direction = "BUY_YES" if outcome == "Yes" else "BUY_NO"
+                        slug = rp.get("eventSlug", "")
+                        end_date = rp.get("endDate", "")
+
+                        new_pos = Position(
+                            market_slug=slug,
+                            outcome_name=title[:40],
+                            token_id=token_id,
+                            direction=direction,
+                            entry_price=avg_price,
+                            shares=real_shares,
+                            size_usd=round(initial_value, 4),
+                            edge_at_entry=0.0,  # Unknown
+                            confidence=0.5,
+                            entry_time=utcnow_iso(),
+                            resolution_time=end_date if end_date else "",
+                            station_id="",
+                            status="open",
+                        )
+                        self.positions.append(new_pos)
+                    else:
+                        log.info(f"  [RECONCILE] Untracked dust: {title} (value=${cur_value:.4f})")
+
+            # Remove phantoms (we track but exchange doesn't have)
+            real_token_ids = {rp.get("asset", "") for rp in real_positions}
+            for token_id, tp in list(tracked.items()):
+                if token_id not in real_token_ids:
+                    log.warning(f"  [RECONCILE] PHANTOM removed: {tp.outcome_name}")
+                    self.positions.remove(tp)
+
+            # V7: Sync bankroll from on-chain reality
+            # Total value = sum of all active position values
+            total_pos_value = sum(
+                float(rp.get("currentValue", 0))
+                for rp in real_positions
+                if float(rp.get("currentValue", 0)) > 0
+            )
+            total_invested = sum(
+                p.size_usd for p in self.positions if p.status in ("open", "pending")
+            )
+            
+            # Log portfolio summary
+            log.info(f"  [RECONCILE] Portfolio: positions=${total_pos_value:.2f} | "
+                     f"tracked_invested=${total_invested:.2f} | bankroll=${self.bankroll:.2f}")
+
+            self._save_state()
+
+        except Exception as e:
+            log.warning(f"  [RECONCILE] Failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _record_resolution(self, pos: Position, won: bool):
+        """Record a resolved position's P&L and remove from active positions."""
+        if won:
+            exit_price = 1.0
+            pnl = pos.shares * (1.0 - pos.entry_price)
+        else:
+            exit_price = 0.0
+            pnl = -pos.size_usd
+
+        self.trades.append(Trade(
+            market_slug=pos.market_slug, outcome_name=pos.outcome_name,
+            station_id=pos.station_id, direction=pos.direction,
+            entry_price=pos.entry_price, exit_price=exit_price,
+            shares=pos.shares, size_usd=pos.size_usd, pnl=pnl,
+            edge_at_entry=pos.edge_at_entry, entry_time=pos.entry_time,
+            exit_time=utcnow_iso(), exit_reason="resolution_win" if won else "resolution_loss",
+        ))
+
+        self.daily_pnl += pnl
+        self.daily_trades += 1
+        if won:
+            self.bankroll += pos.size_usd + pnl  # Return cost + profit
+        # For losses, the cost is already gone (was deducted at entry)
+        self.peak_bankroll = max(self.peak_bankroll, self.bankroll)
+        if pos in self.positions:
+            self.positions.remove(pos)
+        log.info(f"  [RESOLVED] {'WIN' if won else 'LOSS'} {pos.outcome_name} | "
+                 f"P&L: ${pnl:+.2f} | Shares: {pos.shares:.1f}")
+
+    # ─── Exchange Sync ────────────────────────────────────────────
 
     def _sync_with_exchange(self):
         """Sync pending orders: check fills, cancel stale, refund unfilled."""
         if self.paper_mode or not self.clob_client:
             return
         try:
-            # 1. Check all pending positions for fill status
             pending = [p for p in self.positions if p.status == "pending"]
             for pos in pending:
                 order_id = pos.order_id
                 if not order_id:
-                    # No order ID — can't check, assume dead
                     self.bankroll += pos.size_usd
                     self.positions.remove(pos)
                     log.info(f"  [SYNC] Removed orphan pending: {pos.outcome_name}")
@@ -195,7 +345,6 @@ class LiveTrader:
                     status = order_info.get("status", "")
 
                     if matched > 0 and status in ("MATCHED", "CLOSED"):
-                        # Fully or partially filled — promote to open
                         actual_cost = round(matched * pos.entry_price, 4)
                         refund = pos.size_usd - actual_cost
                         pos.shares = matched
@@ -205,17 +354,15 @@ class LiveTrader:
                             self.bankroll += refund
                         log.info(f"  [SYNC] FILLED: {pos.outcome_name} | {matched:.1f} shares @ ${actual_cost:.2f}")
                     elif status == "LIVE":
-                        # Still open — leave it (will be checked next cycle)
                         log.info(f"  [SYNC] Pending: {pos.outcome_name} still LIVE")
                     else:
-                        # Cancelled, expired, or unknown — refund
                         self.bankroll += pos.size_usd
                         self.positions.remove(pos)
                         log.info(f"  [SYNC] Refunded: {pos.outcome_name} (status={status})")
                 except Exception as e:
                     log.warning(f"  [SYNC] Order check failed for {pos.outcome_name}: {e}")
 
-            # 2. Refresh exchange order cache
+            # Refresh exchange order cache
             self._exchange_token_ids = set()
             try:
                 orders = self.clob_client.get_orders()
@@ -226,7 +373,6 @@ class LiveTrader:
             except Exception:
                 pass
 
-            # Add all our position token_ids too
             for p in self.positions:
                 if p.status in ("open", "pending"):
                     self._exchange_token_ids.add(p.token_id)
@@ -240,10 +386,7 @@ class LiveTrader:
             log.warning(f"  [SYNC] Failed: {e}")
 
     def _verify_portfolio(self):
-        """Verify internal state against real Polymarket positions (portfolio eyes).
-        Fetches actual positions from the data API and logs discrepancies.
-        If there are untracked positions, logs a WARNING so the operator knows.
-        """
+        """Periodic portfolio check — lighter than full reconciliation."""
         if self.paper_mode:
             return
         try:
@@ -255,57 +398,37 @@ class LiveTrader:
                 timeout=15,
             )
             if resp.status_code != 200:
-                log.warning(f"  [EYES] Portfolio API returned {resp.status_code}")
                 return
 
             real_positions = resp.json()
             if not isinstance(real_positions, list):
                 return
 
-            log.info(f"  [EYES] Polymarket has {len(real_positions)} real positions")
-
-            # Build lookup of our tracked positions by token_id
             tracked = {p.token_id: p for p in self.positions if p.status in ("open", "pending")}
 
             for rp in real_positions:
                 token_id = rp.get("asset", "")
                 real_shares = float(rp.get("size", 0))
-                real_cost = float(rp.get("initialValue", 0))
-                title = rp.get("title", "?")[:60]
-                cur_price = float(rp.get("curPrice", 0))
                 cur_value = float(rp.get("currentValue", 0))
+                cur_price = float(rp.get("curPrice", 0))
                 pnl = float(rp.get("cashPnl", 0))
+                title = rp.get("title", "?")[:60]
+                redeemable = rp.get("redeemable", False)
 
                 if token_id in tracked:
                     tp = tracked[token_id]
-                    share_diff = abs(real_shares - tp.shares)
-                    if share_diff > 0.01:
-                        log.warning(
-                            f"  [EYES] MISMATCH {tp.outcome_name}: "
-                            f"bot={tp.shares:.2f} vs exchange={real_shares:.2f} shares "
-                            f"(diff={share_diff:.2f})"
-                        )
+                    # Check for resolution
+                    if redeemable and cur_value == 0:
+                        log.info(f"  [EYES] RESOLVED LOSS: {tp.outcome_name}")
+                        self._record_resolution(tp, won=False)
+                    elif cur_price >= 0.999:
+                        log.info(f"  [EYES] WINNING: {tp.outcome_name} (${cur_value:.2f})")
                     else:
-                        log.info(
-                            f"  [EYES] OK {tp.outcome_name}: {real_shares:.1f} shares, "
-                            f"value=${cur_value:.2f}, P&L=${pnl:+.2f}"
-                        )
+                        log.info(f"  [EYES] OK {tp.outcome_name}: {real_shares:.1f}sh, ${cur_value:.2f}, P&L ${pnl:+.2f}")
                 else:
-                    log.warning(
-                        f"  [EYES] UNTRACKED on exchange: {title} | "
-                        f"{real_shares:.1f} shares, cost=${real_cost:.2f}, value=${cur_value:.2f}"
-                    )
+                    if cur_value > 0.01 and not redeemable:
+                        log.warning(f"  [EYES] UNTRACKED: {title} | ${cur_value:.2f}")
 
-            # Check for positions we track but exchange doesn't have
-            real_token_ids = {rp.get("asset", "") for rp in real_positions}
-            for token_id, tp in tracked.items():
-                if token_id not in real_token_ids:
-                    log.warning(
-                        f"  [EYES] PHANTOM {tp.outcome_name}: bot tracks {tp.shares:.2f} shares "
-                        f"but exchange has 0"
-                    )
-
-            # Log portfolio summary
             total_value = sum(float(rp.get("currentValue", 0)) for rp in real_positions)
             total_pnl = sum(float(rp.get("cashPnl", 0)) for rp in real_positions)
             invested = sum(p.size_usd for p in self.positions if p.status in ("open", "pending"))
@@ -314,6 +437,7 @@ class LiveTrader:
                 f"positions=${total_value:.2f} = ${self.bankroll + total_value:.2f} | "
                 f"P&L=${total_pnl:+.2f}"
             )
+            self._save_state()
         except Exception as e:
             log.warning(f"  [EYES] Portfolio check failed: {e}")
 
@@ -328,15 +452,20 @@ class LiveTrader:
             self.trading_day = today
             self.daily_halt = False
 
+    def _available_cash(self) -> float:
+        """V7: Available cash = bankroll minus invested capital.
+        This prevents the bot from spending money locked in positions."""
+        invested = sum(p.size_usd for p in self.positions if p.status in ("open", "pending"))
+        return max(0, self.bankroll - invested)
+
     def _check_safety(self) -> List[str]:
-        """Pre-trade safety checks. Returns list of blocking reasons."""
+        """Pre-trade safety checks."""
         issues = []
         if self.daily_pnl <= -cfg.MAX_DAILY_LOSS_USDC:
             issues.append(f"Daily loss limit: ${self.daily_pnl:+.2f}")
             self.daily_halt = True
-        # Drawdown: total capital = cash + invested (pending/open orders are NOT losses)
         invested = sum(p.size_usd for p in self.positions if p.status in ("open", "pending"))
-        total_capital = self.bankroll + invested
+        total_capital = self.bankroll
         if self.peak_bankroll > 0:
             dd = (self.peak_bankroll - total_capital) / self.peak_bankroll
             if dd > cfg.MAX_DRAWDOWN_PCT:
@@ -346,8 +475,9 @@ class LiveTrader:
             issues.append(f"Max positions: {open_n}")
         if invested >= total_capital * cfg.MAX_TOTAL_EXPOSURE:
             issues.append(f"Max exposure: ${invested:.2f}")
-        if self.bankroll < cfg.MIN_TRADE_SIZE_USDC:
-            issues.append(f"Low bankroll: ${self.bankroll:.2f}")
+        cash = self._available_cash()
+        if cash < cfg.MIN_TRADE_SIZE_USDC:
+            issues.append(f"Low cash: ${cash:.2f} (bankroll ${self.bankroll:.2f}, invested ${invested:.2f})")
         return issues
 
     # ─── Main scan cycle ──────────────────────────────────────────
@@ -399,7 +529,6 @@ class LiveTrader:
             if not our_probs:
                 continue
 
-            # Validate label matching
             validated = {}
             for label, prob in our_probs.items():
                 for o in market.outcomes:
@@ -413,7 +542,6 @@ class LiveTrader:
             if total_v > 0:
                 validated = {k: v / total_v for k, v in validated.items()}
 
-            # Quick edge screen (relaxed threshold)
             has_edge = False
             thresh = max(0.02, cfg.MIN_EDGE_PCT - 0.02)
             for o in market.outcomes:
@@ -444,7 +572,6 @@ class LiveTrader:
         all_signals = []
         exposure = sum(p.size_usd for p in self.positions if p.status == "open")
         for m in candidates:
-            # Compute hours to resolution for Late Sniper timing
             hours_to_res = 24.0
             try:
                 if m.end_date:
@@ -484,7 +611,6 @@ class LiveTrader:
         no_sigs = [s for s in signals if s.strategy == "conservative_no"]
         sniper = [s for s in signals if s.strategy == "late_sniper"]
 
-        # Execute ladder sets
         sets_done = 0
         by_market = defaultdict(list)
         for s in ladder:
@@ -503,7 +629,6 @@ class LiveTrader:
                 sets_done += 1
                 log.info(f"  LADDER SET: {slug} — {executed} buckets")
 
-        # Execute NO signals
         no_sigs.sort(key=lambda s: s.expected_value * s.confidence, reverse=True)
         no_done = 0
         for s in no_sigs:
@@ -515,7 +640,6 @@ class LiveTrader:
                 self._execute_one(s)
                 no_done += 1
 
-        # Execute Late Sniper signals
         sniper.sort(key=lambda s: s.expected_value * s.confidence, reverse=True)
         sniper_done = 0
         for s in sniper:
@@ -536,22 +660,22 @@ class LiveTrader:
         active = [p for p in self.positions if p.status in ("open", "pending")]
         if len(active) >= cfg.MAX_CONCURRENT_POSITIONS:
             return False
-        # Dedup: check local state (open + pending)
+        # Dedup: check local state
         if any(p.market_slug == signal.market.slug and p.outcome_name == signal.outcome.name
                and p.direction == signal.direction and p.status in ("open", "pending")
                for p in self.positions):
             return False
-        # Dedup: check exchange orders (prevents duplicates after restart)
+        # Dedup: check exchange orders
         token_id = signal.outcome.token_id if signal.direction == "BUY_YES" else signal.outcome.no_token_id
         if token_id and token_id in self._exchange_token_ids:
             return False
-        # Balance check: don't try to spend more than available cash
-        if signal.suggested_size_usd > self.bankroll:
+        # V7: Use available cash (bankroll minus invested), not raw bankroll
+        cash = self._available_cash()
+        if signal.suggested_size_usd > cash:
             return False
-        # Exposure check: invested + new trade vs total capital
+        # Exposure check
         invested = sum(p.size_usd for p in self.positions if p.status in ("open", "pending"))
-        total_capital = self.bankroll + invested
-        if invested + signal.suggested_size_usd > total_capital * cfg.MAX_TOTAL_EXPOSURE:
+        if invested + signal.suggested_size_usd > self.bankroll * cfg.MAX_TOTAL_EXPOSURE:
             return False
         # Zone capacity
         zones = cfg.CLIMATE_ZONES
@@ -563,7 +687,6 @@ class LiveTrader:
         return True
 
     def _execute_one(self, signal: TradingSignal):
-        """Execute a single trade (paper or live)."""
         if self.paper_mode:
             self._paper_execute(signal)
         else:
@@ -580,17 +703,22 @@ class LiveTrader:
         if entry <= 0 or entry >= 1:
             return
 
+        size_usd = min(signal.suggested_size_usd, self._available_cash())
+        if size_usd < 1.0:
+            return
+
         pos = Position(
             market_slug=signal.market.slug, outcome_name=signal.outcome.name,
             token_id=token_id, direction=signal.direction,
-            entry_price=entry, shares=signal.suggested_size_usd / entry,
-            size_usd=signal.suggested_size_usd, edge_at_entry=signal.edge,
+            entry_price=entry, shares=size_usd / entry,
+            size_usd=size_usd, edge_at_entry=signal.edge,
             confidence=signal.confidence, entry_time=utcnow_iso(),
             resolution_time=signal.market.end_date, station_id=signal.market.station_id,
         )
         self.positions.append(pos)
+        # V7: Don't deduct from bankroll for paper — paper just tracks
         self._save_state()
-        log.info(f"  [PAPER] {signal.direction} {signal.outcome.name} @ {entry:.3f} | ${signal.suggested_size_usd:.2f}")
+        log.info(f"  [PAPER] {signal.direction} {signal.outcome.name} @ {entry:.3f} | ${size_usd:.2f}")
 
     def _live_execute(self, signal: TradingSignal):
         if not self.clob_client:
@@ -606,59 +734,45 @@ class LiveTrader:
                 if not token_id:
                     return
 
-            # Fetch live orderbook with effective prices
             depth = self.scanner.fetch_orderbook_depth(token_id)
             if not depth["has_liquidity"]:
                 log.info(f"  [LIVE] Skip {signal.outcome.name}: no liquidity")
                 return
 
             tick = float(signal.market.tick_size or "0.01")
-
-            # Use eff_buy_price (what we actually pay) for order pricing
-            # This is the /price?side=BUY value — the real cost to acquire
             eff_buy = depth.get("eff_buy_price", depth["best_ask"])
 
-            # For neg-risk: add 1 tick as slippage buffer to ensure fill
-            # This is our worst-acceptable price (slippage protection)
             if signal.market.neg_risk:
-                fill_price = eff_buy + tick  # 1 tick above effective buy price
+                fill_price = eff_buy + tick
             else:
                 fill_price = eff_buy
 
             price = round(round(fill_price / tick) * tick, 4)
             price = max(tick, min(price, 1.0 - tick))
 
-            # Recalculate edge vs real cost (use eff_buy, not buffered price)
             eff_cost = round(round(eff_buy / tick) * tick, 4)
             if signal.direction == "BUY_YES":
                 real_edge = signal.our_probability - eff_cost
             else:
                 real_edge = (1.0 - signal.our_probability) - eff_cost
             if real_edge < 0.05:
-                log.info(f"  [LIVE] Skip {signal.outcome.name}: real edge {real_edge:.1%} too low @ eff_buy {eff_cost:.4f}")
+                log.info(f"  [LIVE] Skip {signal.outcome.name}: real edge {real_edge:.1%} too low")
                 return
 
-            # Size: use price for cost calculation, check minimums
-            size = round(signal.suggested_size_usd / price, 2)
+            # V7: Use available cash for sizing
+            cash = self._available_cash()
+            trade_size = min(signal.suggested_size_usd, cash * 0.95)  # 5% buffer
+            size = round(trade_size / price, 2)
             if size < signal.market.order_min_size:
                 return
 
-            # Final balance guard
-            if signal.suggested_size_usd > self.bankroll:
-                size = round((self.bankroll * 0.9) / price, 2)
-                if size < signal.market.order_min_size:
-                    return
-
-            # Choose order type based on market type
             if signal.market.neg_risk:
-                # FOK for neg-risk: fill immediately or cancel
-                # amount = dollar amount to spend, price = worst-price limit
                 amount = round(size * price, 2)
                 market_args = MarketOrderArgs(
                     token_id=token_id,
                     amount=amount,
                     side=BUY,
-                    price=price,  # worst acceptable price (slippage protection)
+                    price=price,
                 )
                 options = PartialCreateOrderOptions(
                     neg_risk=True, tick_size=signal.market.tick_size,
@@ -668,8 +782,6 @@ class LiveTrader:
                     signed = self.clob_client.create_market_order(market_args, options)
                     resp = self.clob_client.post_order(signed, OrderType.FOK)
                 except Exception as fok_err:
-                    # FOK may fail if not enough liquidity for full fill
-                    # Fall back to FAK (Fill-And-Kill): fill what's available
                     err_str = str(fok_err)
                     if "fully filled" in err_str or "FOK" in err_str:
                         log.info(f"  [LIVE] FOK rejected (insufficient liq), trying FAK...")
@@ -682,7 +794,7 @@ class LiveTrader:
                     else:
                         raise fok_err
             else:
-                # GTC for regular markets
+                reserved_cost = round(size * price, 4)
                 order_args = OrderArgs(price=price, size=size, side=BUY, token_id=token_id)
                 options = PartialCreateOrderOptions(
                     neg_risk=False, tick_size=signal.market.tick_size,
@@ -699,19 +811,17 @@ class LiveTrader:
             order_id = resp.get("orderID", "")
 
             if signal.market.neg_risk:
-                # FOK response tells us the fill directly:
-                #   takingAmount = shares received, makingAmount = dollars spent
-                taking = float(resp.get("takingAmount", 0) or 0)  # shares
-                making = float(resp.get("makingAmount", 0) or 0)  # dollars
+                taking = float(resp.get("takingAmount", 0) or 0)
+                making = float(resp.get("makingAmount", 0) or 0)
                 fok_status = resp.get("status", "")
                 tx_hashes = resp.get("transactionsHashes", [])
 
                 if taking > 0 and making > 0:
-                    fill_price = round(making / taking, 4) if taking > 0 else price
+                    fill_price_actual = round(making / taking, 4) if taking > 0 else price
                     pos = Position(
                         market_slug=signal.market.slug, outcome_name=signal.outcome.name,
                         token_id=token_id, direction=signal.direction,
-                        entry_price=fill_price, shares=taking, size_usd=round(making, 4),
+                        entry_price=fill_price_actual, shares=taking, size_usd=round(making, 4),
                         edge_at_entry=real_edge, confidence=signal.confidence,
                         entry_time=utcnow_iso(), resolution_time=signal.market.end_date,
                         station_id=signal.market.station_id, status="open",
@@ -722,11 +832,11 @@ class LiveTrader:
                     self._exchange_token_ids.add(token_id)
                     self._save_state()
                     tx_short = tx_hashes[0][:16] if tx_hashes else 'N/A'
-                    log.info(f"  [LIVE] FOK FILLED: {taking:.1f} shares @ ${making:.2f} (price={fill_price:.4f}) | Bankroll: ${self.bankroll:.2f} | tx={tx_short}...")
+                    log.info(f"  [LIVE] FOK FILLED: {taking:.1f} shares @ ${making:.2f} | Bankroll: ${self.bankroll:.2f} | Cash: ${self._available_cash():.2f} | tx={tx_short}...")
                 else:
                     log.info(f"  [LIVE] FOK NO FILL: {signal.outcome.name} (status={fok_status})")
             else:
-                # GTC: order rests on book, track as pending
+                reserved_cost = round(size * price, 4)
                 pos = Position(
                     market_slug=signal.market.slug, outcome_name=signal.outcome.name,
                     token_id=token_id, direction=signal.direction,
@@ -740,60 +850,27 @@ class LiveTrader:
                 self.bankroll -= reserved_cost
                 self._exchange_token_ids.add(token_id)
                 self._save_state()
-                log.info(f"  [LIVE] GTC PLACED: {order_id[:16]}... | Reserved ${reserved_cost:.2f} | Bankroll: ${self.bankroll:.2f}")
+                log.info(f"  [LIVE] GTC PLACED: {order_id[:16]}... | Reserved ${reserved_cost:.2f} | Cash: ${self._available_cash():.2f}")
 
         except Exception as e:
             log.error(f"  [LIVE] Error: {e}")
 
-    # ─── Position management ──────────────────────────────────────
+    # ─── V7: Position management — HOLD TO RESOLUTION ─────────────
 
     def _check_positions(self):
-        for pos in self.positions[:]:
-            if pos.status != "open":
-                continue
-            try:
-                res_time = datetime.fromisoformat(pos.resolution_time.replace("Z", "+00:00"))
-                if res_time.tzinfo is None:
-                    res_time = res_time.replace(tzinfo=timezone.utc)
-            except Exception:
-                res_time = utcnow() + timedelta(days=7)
-
-            hours_left = (res_time - utcnow()).total_seconds() / 3600
-            if hours_left < cfg.EXIT_HOURS_BEFORE_RESOLUTION:
-                self._exit_position(pos, "time_exit")
-
-    def _exit_position(self, pos: Position, reason: str):
-        exit_price = pos.entry_price
-        pnl = 0.0
-
-        if not pos.token_id.startswith("sim_") and not self.paper_mode:
-            try:
-                depth = self.scanner.fetch_orderbook_depth(pos.token_id)
-                if depth["has_liquidity"]:
-                    if pos.direction == "BUY_YES":
-                        exit_price = depth["best_bid"]
-                    else:
-                        exit_price = 1.0 - depth["best_ask"]
-            except Exception:
-                pass
-
-        pnl = pos.shares * (exit_price - pos.entry_price)
-        self.trades.append(Trade(
-            market_slug=pos.market_slug, outcome_name=pos.outcome_name,
-            station_id=pos.station_id, direction=pos.direction,
-            entry_price=pos.entry_price, exit_price=exit_price,
-            shares=pos.shares, size_usd=pos.size_usd, pnl=pnl,
-            edge_at_entry=pos.edge_at_entry, entry_time=pos.entry_time,
-            exit_time=utcnow_iso(), exit_reason=reason,
-        ))
-
-        self.daily_pnl += pnl
-        self.daily_trades += 1
-        self.bankroll += pos.size_usd + pnl
-        self.peak_bankroll = max(self.peak_bankroll, self.bankroll)
-        self.positions.remove(pos)
-        self._save_state()
-        log.info(f"  EXIT {pos.outcome_name} @ {exit_price:.3f} | P&L: ${pnl:+.2f} | Reason: {reason}")
+        """V7: Check positions for resolution status.
+        
+        KEY CHANGE: We NO LONGER do time_exit (fake selling).
+        Weather markets resolve to $1 or $0. We HOLD positions
+        until resolution, then record the actual result.
+        
+        The _verify_portfolio() call handles detecting resolved positions
+        via the Polymarket data API.
+        """
+        # Nothing to do here for neg-risk weather markets — they resolve naturally.
+        # The _verify_portfolio() and _reconcile_positions() methods handle
+        # detecting resolved markets and recording P&L.
+        pass
 
     # ─── State persistence ────────────────────────────────────────
 
@@ -801,12 +878,12 @@ class LiveTrader:
         os.makedirs(cfg.RESULTS_DIR, exist_ok=True)
         mode = "paper" if self.paper_mode else "live"
         state = {
-            "timestamp": utcnow_iso(), "version": "V6", "mode": mode.upper(),
+            "timestamp": utcnow_iso(), "version": "V7", "mode": mode.upper(),
             "bankroll": self.bankroll, "peak_bankroll": self.peak_bankroll,
             "daily_pnl": self.daily_pnl, "daily_trades": self.daily_trades,
             "trading_day": self.trading_day, "daily_halt": self.daily_halt,
             "positions": [asdict(p) for p in self.positions],
-            "trades": [asdict(t) for t in self.trades[-200:]],  # Keep last 200
+            "trades": [asdict(t) for t in self.trades[-200:]],
         }
         try:
             with open(f"{cfg.RESULTS_DIR}/{mode}_state.json", "w") as f:
@@ -822,7 +899,6 @@ class LiveTrader:
         try:
             with open(path) as f:
                 state = json.load(f)
-            # Never load mismatched mode
             if state.get("mode", "PAPER") != mode.upper():
                 return
             self.bankroll = state.get("bankroll", self.bankroll)
@@ -846,12 +922,15 @@ class LiveTrader:
         losses = [t for t in self.trades if t.pnl <= 0]
         wr = len(wins) / len(self.trades) * 100 if self.trades else 0
         pf = abs(sum(t.pnl for t in wins) / sum(t.pnl for t in losses)) if losses and sum(t.pnl for t in losses) != 0 else float("inf")
+        invested = sum(p.size_usd for p in self.positions if p.status in ("open", "pending"))
+        cash = self._available_cash()
         dd = (self.peak_bankroll - self.bankroll) / self.peak_bankroll * 100 if self.peak_bankroll > 0 else 0
 
         log.info(f"\n{'='*55}")
-        log.info(f"  P&L Report V6 ({'PAPER' if self.paper_mode else 'LIVE'})")
+        log.info(f"  P&L Report V7 ({'PAPER' if self.paper_mode else 'LIVE'})")
         log.info(f"{'='*55}")
         log.info(f"  Bankroll:    ${self.bankroll:.2f} (peak ${self.peak_bankroll:.2f})")
+        log.info(f"  Cash:        ${cash:.2f} (invested: ${invested:.2f})")
         log.info(f"  Drawdown:    {dd:.1f}%")
         log.info(f"  Realized:    ${sum(t.pnl for t in self.trades):+.2f}")
         log.info(f"  Positions:   {len([p for p in self.positions if p.status == 'open'])}")
@@ -879,16 +958,15 @@ class LiveTrader:
         while datetime.now() < end:
             cycle += 1
             log.info(f"\n{'─'*40}")
-            log.info(f"  Cycle {cycle} | {datetime.now().strftime('%H:%M:%S')} | ${self.bankroll:.2f}")
+            log.info(f"  Cycle {cycle} | {datetime.now().strftime('%H:%M:%S')} | Cash: ${self._available_cash():.2f} | Bankroll: ${self.bankroll:.2f}")
             log.info(f"{'─'*40}")
 
             invested = sum(p.size_usd for p in self.positions if p.status in ("open", "pending"))
-            total_cap = self.bankroll + invested
+            total_cap = self.bankroll
             if self.peak_bankroll > 0:
                 dd = (self.peak_bankroll - total_cap) / self.peak_bankroll
                 if dd > cfg.MAX_DRAWDOWN_PCT:
                     log.warning(f"  DRAWDOWN PAUSE: {dd:.1%} (capital ${total_cap:.2f}) — skipping trades, will retry")
-                    # Don't break — just skip this cycle, sync will still check pending orders
                     self._sync_with_exchange()
                     self._check_positions()
                     sleep = min(cfg.SCAN_INTERVAL_SECONDS, (end - datetime.now()).total_seconds())

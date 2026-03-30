@@ -1,5 +1,5 @@
 """
-Polymarket Weather Bot V6.2 — Configuration
+Polymarket Weather Bot V7 — Configuration
 =============================================
 All tunable parameters in one place.
 
@@ -140,9 +140,9 @@ MAX_TRADE_SIZE_USDC = 5.0
 # ═══════════════════════════════════════════════════════════════════
 BANKROLL = float(os.getenv("POLYMARKET_BANKROLL", "100.0"))
 MAX_DAILY_LOSS_USDC = 20.0
-MAX_DRAWDOWN_PCT = 0.20
+MAX_DRAWDOWN_PCT = 0.40  # V7: more relaxed for small bankroll (was 0.20)
 TAKE_PROFIT_EDGE_PCT = 0.03
-EXIT_HOURS_BEFORE_RESOLUTION = 3
+EXIT_HOURS_BEFORE_RESOLUTION = 0  # V7: HOLD TO RESOLUTION (was 3)
 MAX_POSITIONS_PER_ZONE = 3
 
 # ═══════════════════════════════════════════════════════════════════
